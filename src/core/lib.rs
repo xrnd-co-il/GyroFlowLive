@@ -149,6 +149,10 @@ impl Default for StabilizationManager {
     }
 }
 
+
+
+
+
 impl StabilizationManager {
     pub fn init_from_video_data(&self, duration_ms: f64, fps: f64, frame_count: usize, video_size: (usize, usize)) {
         {
@@ -194,6 +198,8 @@ impl StabilizationManager {
         };
 
         let cancel_flag2 = cancel_flag.clone();
+        
+        //need to change the line below to make it support live video
         let mut md = GyroSource::parse_telemetry_file(url, options, size, fps, progress_cb, cancel_flag2)?;
         if md.detected_source.as_ref().map(|v| v.starts_with("GoPro ")).unwrap_or_default() {
             // If gopro reports rolling shutter value, it already applied it, ie. the video is already corrected

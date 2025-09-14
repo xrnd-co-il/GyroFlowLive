@@ -8,6 +8,7 @@ pub mod splines;
 pub use file_metadata::*;
 pub use imu_transforms::*;
 pub use sony::interpolate_mesh;
+pub mod live;
 
 use nalgebra::*;
 use std::iter::zip;
@@ -33,6 +34,27 @@ pub type TimeIMU = telemetry_parser::util::IMUData;
 pub type TimeQuat = BTreeMap<i64, Quat64>; // key is timestamp_us
 pub type TimeVec = BTreeMap<i64, Vector3<f64>>; // key is timestamp_us
 
+pub fn make_header(period: f64) -> String {
+    let period = 1.0 / period; // convert fps to period
+    format!(
+        "GYROFLOW IMU LOG
+version,1.3
+id,custom_logger_name
+orientation,YxZ
+note,development_test
+fwversion,FIRMWARE_0.1.0
+timestamp,1644159993
+vendor,potatocam
+videofilename,videofilename.mp4
+lensprofile,potatocam/potatocam_mark1_prime_7_5mm_4k
+lens_info,wide
+frame_readout_time,15.23
+frame_readout_direction,0
+tscale,{period}
+gscale,0.00122173047
+ascale,0.00048828125"
+    )
+}
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileLoadOptions {
     pub sample_index: Option<usize>
@@ -68,7 +90,10 @@ pub struct GyroSource {
     offsets_linear: BTreeMap<i64, f64>, // <microseconds timestamp, offset in milliseconds> - linear fit
     offsets_adjusted: BTreeMap<i64, f64>, // <timestamp + offset, offset>
 
-    pub file_url: String
+    pub file_url: String,
+
+    pub live: std::sync::Arc<parking_lot::RwLock<Option<live::LiveState>>>,
+
 }
 
 impl GyroSource {
@@ -100,6 +125,28 @@ impl GyroSource {
         }
         self.horizon_lock_integration_method = v;
     }
+
+    /* live handling */
+    pub fn enable_live(&self, keep_seconds: f64, a: f64, b: f64) {
+        let mut st = self.live.write();
+        *st = Some(live::LiveState {
+            header: make_header(60.0), //fps of the video 
+            ring: live::ImuRing::new((keep_seconds * 1_000_000.0) as i64),
+            sync: live::LiveClockSync { a, b },
+            enabled: true,
+        });
+    }
+
+    pub fn disable_live(&self) {
+        *self.live.write() = None;
+    }
+
+    pub fn push_live_imu(&self, ts_sensor_us: i64, gyro: [f64;3], accel: Option<[f64;3]>, now_video_us: i64) {
+        if let Some(st) = self.live.write().as_mut() {
+            st.ring.push(live::LiveImuSample { ts_sensor_us, gyro, accel }, now_video_us, &st.sync);
+        }
+    }
+    /* end live handling */
 
     pub fn init_from_params(&mut self, stabilization_params: &StabilizationParams) {
         self.duration_ms = stabilization_params.get_scaled_duration_ms();
