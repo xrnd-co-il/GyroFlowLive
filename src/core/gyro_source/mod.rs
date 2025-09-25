@@ -126,11 +126,11 @@ impl GyroSource {
         self.horizon_lock_integration_method = v;
     }
 
-    /* live handling */
-    pub fn enable_live(&self, keep_seconds: f64, a: f64, b: f64) {
+    // src/core/gyro_source/mod.rs (within impl GyroSource)
+    pub fn enable_live(&self, keep_seconds: f64, a: f64, b: f64, video_fps: f64) {
         let mut st = self.live.write();
         *st = Some(live::LiveState {
-            header: make_header(60.0), //fps of the video 
+            header: make_header(video_fps),              // use actual video FPS
             ring: live::ImuRing::new((keep_seconds * 1_000_000.0) as i64),
             sync: live::LiveClockSync { a, b },
             enabled: true,
@@ -144,6 +144,65 @@ impl GyroSource {
     pub fn push_live_imu(&self, ts_sensor_us: i64, gyro: [f64;3], accel: Option<[f64;3]>, now_video_us: i64) {
         if let Some(st) = self.live.write().as_mut() {
             st.ring.push(live::LiveImuSample { ts_sensor_us, gyro, accel }, now_video_us, &st.sync);
+        }
+    }
+
+    pub fn integrate_live_data(&mut self) {
+        // Only proceed if live mode is active
+        let live_opt = self.live.read();
+        if live_opt.is_none() {
+            return;
+        }
+        // Clone the IMU samples from the ring buffer to work on (avoid holding lock during heavy computation)
+        let live_state = live_opt.as_ref().unwrap();
+        let samples: Vec<LiveImuSample> = live_state.ring.buf.iter().copied().collect();
+        drop(live_opt);  // release the read lock
+
+        if samples.is_empty() {
+            log::warn!("No IMU samples available for live integration");
+            return;
+        }
+
+        // Convert LiveImuSample data into TimeIMU (telemetry_parser::IMUData) for integration
+        let mut imu_data_vec: Vec<TimeIMU> = Vec::with_capacity(samples.len());
+        for s in &samples {
+            let mut imu_point = TimeIMU::default();
+            imu_point.timestamp_ms = s.ts_sensor_us as f64 / 1000.0;
+            imu_point.gyro = Some(s.gyro);
+            imu_point.accl = s.accel;
+            imu_data_vec.push(imu_point);
+        }
+        // Determine the time span of these samples (for integrator scaling)
+        let start_ms = imu_data_vec.first().unwrap().timestamp_ms;
+        let end_ms   = imu_data_vec.last().unwrap().timestamp_ms;
+        let duration_ms = end_ms - start_ms;
+
+        // Integrate gyroscope (and accelerometer) data to compute orientation quaternions
+        self.quaternions.clear();
+        self.smoothed_quaternions.clear();
+        let quat_map: BTreeMap<i64, Quat64> = match self.integration_method {
+            1 => ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms),
+            2 => VQFIntegrator::integrate(&imu_data_vec, duration_ms),
+            3 => SimpleGyroIntegrator::integrate(&imu_data_vec, duration_ms),
+            4 => SimpleGyroAccelIntegrator::integrate(&imu_data_vec, duration_ms),
+            5 => MahonyIntegrator::integrate(&imu_data_vec, duration_ms),
+            6 => MadgwickIntegrator::integrate(&imu_data_vec, duration_ms),
+            0 | _ => {  // 0 or unknown: fallback
+                log::info!("Using Complementary filter for live data (fallback)");
+                ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms)
+            }
+        };
+        self.quaternions = quat_map;
+        // For now, use the same quaternions as "smoothed" baseline (smoothing applied in next step if needed)
+        if self.quaternions.len() >= 2 {
+            // Smooth the most recent orientation with the previous one
+            if let Some((last_ts, last_q)) = self.quaternions.iter().next_back() {
+                if let Some((prev_ts, prev_q)) = self.quaternions.range(..*last_ts).next_back() {
+                    // Slerp 50% towards the previous orientation to dampen quick changes
+                    let blended = prev_q.slerp(last_q, 0.5);
+                    self.smoothed_quaternions.insert(*last_ts, blended);
+                }
+            }
         }
     }
     /* end live handling */

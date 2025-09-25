@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-sub-proj2 = { path = "C:\git\gyroflow\src\core" }
+gyroflow-core = { path = "C:\\git\\gyroflow\\src\\core" }

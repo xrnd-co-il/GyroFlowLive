@@ -17,8 +17,8 @@ pub struct LiveClockSync {
 }
 
 pub struct ImuRing {
-    buf: VecDeque<LiveImuSample>,
-    keep_us: i64, // e.g. 3_000_000
+    pub buf: VecDeque<LiveImuSample>,
+    pub keep_us: i64, // e.g. 3_000_000
 }
 
 impl ImuRing {

@@ -172,6 +172,14 @@ impl StabilizationManager {
     }
 
     pub fn load_gyro_data<F: Fn(f64)>(&self, url: &str, is_main_video: bool, options: &gyro_source::FileLoadOptions, progress_cb: F, cancel_flag: Arc<AtomicBool>) -> std::result::Result<(), GyroflowCoreError> {
+        if url == "live" || url.starts_with("live:") {
+            // Initialize live IMU streaming for real-time stabilization
+            let fps = self.params.read().fps;
+            let mut gyro: parking_lot::lock_api::RwLockWriteGuard<'_, parking_lot::RawRwLock, GyroSource> = self.gyro.write();
+            gyro.enable_live(3.0, 1.0, 0.0, fps);  // e.g., keep 3 seconds of data, initial sync a=1, b=0
+            log::info!("Live video stabilization enabled (keep {}s of IMU data)", 3.0);
+            return Ok(());  // Skip file parsing for live source
+        }
         {
             let params = self.params.read();
             let mut gyro = self.gyro.write();
@@ -288,7 +296,7 @@ impl StabilizationManager {
             (self.lens.write().load_from_file(&url), false)
         };
         let (width, height, aspect, id, fps) = {
-            let params = self.params.read();
+            let params = self.params.read();    
             (params.size.0, params.size.1, ((params.size.0 * 100) as f64 / params.size.1.max(1) as f64).round() as u32, self.camera_id.read().as_ref().map(|x| x.get_identifier_for_autoload()).unwrap_or_default(), (params.fps * 100.0).round() as i32)
         };
 
