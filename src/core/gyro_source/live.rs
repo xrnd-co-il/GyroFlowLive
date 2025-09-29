@@ -16,10 +16,12 @@ pub struct LiveClockSync {
     pub b: f64,  // offset
 }
 
+#[derive(Default)]
 pub struct ImuRing {
     pub buf: VecDeque<LiveImuSample>,
     pub keep_us: i64, // e.g. 3_000_000
 }
+
 
 impl ImuRing {
     pub fn new(keep_us: i64) -> Self { Self { buf: VecDeque::new(), keep_us } }

@@ -23,6 +23,8 @@ use crate::camera_identifier::CameraIdentifier;
 use crate::stabilization_params::ReadoutDirection;
 use crate::filesystem;
 
+use live::LiveImuSample;
+
 use super::imu_integration::*;
 use super::smoothing::SmoothingAlgorithm;
 use crate::StabilizationParams;
@@ -92,6 +94,7 @@ pub struct GyroSource {
 
     pub file_url: String,
 
+    #[serde(skip, default)]
     pub live: std::sync::Arc<parking_lot::RwLock<Option<live::LiveState>>>,
 
 }
@@ -180,7 +183,7 @@ impl GyroSource {
         // Integrate gyroscope (and accelerometer) data to compute orientation quaternions
         self.quaternions.clear();
         self.smoothed_quaternions.clear();
-        let quat_map: BTreeMap<i64, Quat64> = match self.integration_method {
+        let quat_map: TimeQuat = match self.integration_method {
             1 => ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms),
             2 => VQFIntegrator::integrate(&imu_data_vec, duration_ms),
             3 => SimpleGyroIntegrator::integrate(&imu_data_vec, duration_ms),
