@@ -136,6 +136,7 @@ impl GyroSource {
             header: make_header(video_fps),              // use actual video FPS
             ring: live::ImuRing::new((keep_seconds * 1_000_000.0) as i64),
             sync: live::LiveClockSync { a, b },
+            quat_buffer_store: live::QuatBufferStore::new(),
             enabled: true,
         });
     }
@@ -181,8 +182,7 @@ impl GyroSource {
         let duration_ms = end_ms - start_ms;
 
         // Integrate gyroscope (and accelerometer) data to compute orientation quaternions
-        self.quaternions.clear();
-        self.smoothed_quaternions.clear();
+        //the quat is sorted by time.
         let quat_map: TimeQuat = match self.integration_method {
             1 => ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms),
             2 => VQFIntegrator::integrate(&imu_data_vec, duration_ms),
@@ -195,7 +195,11 @@ impl GyroSource {
                 ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms)
             }
         };
-        self.quaternions = quat_map;
+
+        if let Some(st) = self.live.write().as_mut() {
+            st.quat_buffer_store.publish(buf) //need to be done
+        }
+        
         // For now, use the same quaternions as "smoothed" baseline (smoothing applied in next step if needed)
         if self.quaternions.len() >= 2 {
             // Smooth the most recent orientation with the previous one
@@ -864,29 +868,41 @@ impl GyroSource {
         self.integrate();
     }
 
-    fn quat_at_timestamp(&self, quats: &TimeQuat, mut timestamp_ms: f64) -> Quat64 {
-        if quats.len() < 2 || self.duration_ms <= 0.0 { return Quat64::identity(); }
+   fn quat_at_timestamp(&self, quats: &TimeQuat, mut timestamp_ms: f64) -> Quat64 {
+    // 0) Guard rails
+    if quats.len() < 2 || self.duration_ms <= 0.0 { 
+        return Quat64::identity(); 
+    }
 
-        timestamp_ms -= self.offset_at_video_timestamp(timestamp_ms);
+    // 1) Sync correction (video↔IMU offset/drift)
+    timestamp_ms -= self.offset_at_video_timestamp(timestamp_ms);
 
-        if let Some(&first_ts) = quats.keys().next() {
-            if let Some(&last_ts) = quats.keys().next_back() {
-                let lookup_ts = ((timestamp_ms * 1000.0).round() as i64).min(last_ts).max(first_ts);
+    // 2) Clamp the lookup time to available IMU range (keys are µs)
+    if let Some(&first_ts) = quats.keys().next() {
+        if let Some(&last_ts) = quats.keys().next_back() {
+            let lookup_ts = ((timestamp_ms * 1000.0).round() as i64)
+                .min(last_ts)
+                .max(first_ts);
 
-                if let Some(quat1) = quats.range(..=lookup_ts).next_back() {
-                    if *quat1.0 == lookup_ts {
-                        return *quat1.1;
-                    }
-                    if let Some(quat2) = quats.range(lookup_ts..).next() {
-                        let time_delta = (quat2.0 - quat1.0) as f64;
-                        let fract = (lookup_ts - quat1.0) as f64 / time_delta;
-                        return quat1.1.slerp(quat2.1, fract);
-                    }
+            // 3) Find bracketing samples in the BTreeMap
+            if let Some(quat1) = quats.range(..=lookup_ts).next_back() {
+                // 3a) Exact hit → return directly
+                if *quat1.0 == lookup_ts {
+                    return *quat1.1;
+                }
+                // 3b) Interpolate to the next sample (SLERP)
+                if let Some(quat2) = quats.range(lookup_ts..).next() {
+                    let time_delta = (quat2.0 - quat1.0) as f64;        // µs
+                    let fract = (lookup_ts - quat1.0) as f64 / time_delta;
+                    return quat1.1.slerp(quat2.1, fract);
                 }
             }
         }
-        Quat64::identity()
     }
+
+    // 4) Fallback (should only happen on empty/degenerate inputs)
+    Quat64::identity()
+}
 
     pub fn      org_quat_at_timestamp(&self, timestamp_ms: f64) -> Quat64 { self.quat_at_timestamp(&self.quaternions,          timestamp_ms) }
     pub fn smoothed_quat_at_timestamp(&self, timestamp_ms: f64) -> Quat64 { self.quat_at_timestamp(&self.smoothed_quaternions, timestamp_ms) }
