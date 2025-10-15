@@ -1,240 +1,95 @@
-// src/main.rs
-
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
-use std::thread;
-use std::time::{Duration, Instant};
-use std::sync::mpsc::{self, Receiver};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use core::gyro_source::LiveImuSample;
+use core::lib::StabilizationManager;
 
-use log::{debug, error, info, warn};
 
-// ---- Configure your IMU TCP endpoint here ----
-const IMUport: u16 = 7007; // <-- set your port
 
-// ---- Types you already have / expect in your codebase ----
-// Adjust the module paths if needed.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LiveImuSample {
-    pub ts_sensor_us: u64,
-    pub gyro: [f32; 3],
-    pub accel: [f32; 3],
-}
+const IMU_ADDR: &str = "127.0.0.1:7007";
+const FRAME_ADDR: &str = "127.0.0.1:7008";
 
-// Minimal trait-like facade so you can adapt to your real manager.
-// Replace bodies with your actual API if different.
-mod gyroflow_live {
-    use super::LiveImuSample;
+fn main(){
 
-    // Re-export your real manager type. If it's in another module, change the path:
-    // pub use crate::libs::StablizerManager;
-    // For now we declare a stub so this compiles until you hook the real one.
-    pub struct StablizerManager {
-        // TODO: your internal fields; ring, params, etc.
-        // We keep a small user-land ring here only as a placeholder.
-        ring: std::sync::Mutex<std::collections::VecDeque<LiveImuSample>>,
-        ring_cap: usize,
-    }
+   /*  let stab_man: StabilizationManager = StabilizationManager::default();
+        pub fn load_gyro_data<F: Fn(f64)>(&self, 
+            url: &str, 
+            is_main_video: 
+            bool, options: 
+            &gyro_source::FileLoadOptions, progress_cb: F, cancel_flag: Arc<AtomicBool>) -> std::result::Result<(), GyroflowCoreError> 
 
-    impl StablizerManager {
-        pub fn new_with_live() -> Self {
-            Self {
-                ring: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(4096)),
-                ring_cap: 4096,
-            }
+*/
+    //stab_man.load_gyro_data("live", true,);
+
+
+    let stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    let (imu_rx, imu_tx) = unbounded::<LiveImuSample>();
+    spawn_line_reader<LiveImuSample>("imu thread", IMU_ADDR, imu_tx, stop, parse_imu_line);
+
+    thread::spawn(move || {
+        while let ok(imu_sample) = imu_rx.recv(){
+            stab_man.gyro_source.push_live_imu(imu_sample)
         }
+    });
 
-        /// Push a live sample into the manager’s ring.
-        /// In your code, this should call the REAL push into your IMU ring.
-        pub fn push_live_sample(&self, s: LiveImuSample) {
-            let mut g = self.ring.lock().unwrap();
-            if g.len() == self.ring_cap {
-                g.pop_front();
-            }
-            g.push_back(s);
-        }
 
-        /// Integrate live data (your real function should read from its live ring).
-        pub fn integrate_live_data(&mut self) {
-            // TODO: call your real implementation
-            // e.g., self.telemetry.integrate_live_data();
-            // For placeholder:
-            log::debug!("integrate_live_data() tick");
-        }
-
-        /// Generate STMaps for the current live frame/batch.
-        /// You said you'll implement this later; we simply call it.
-        pub fn generate_stmaps_live(&mut self) {
-            // TODO: your real generate_stmaps_live implementation.
-            log::debug!("generate_stmaps_live() tick");
-        }
-    }
 }
 
-use gyroflow_live::StablizerManager;
 
-// -------------------- IMU PARSER --------------------
-
-fn parse_imu_line(line: &str) -> Option<LiveImuSample> {
-    let s = line.trim();
-    if s.is_empty() { return None; }
-
-    // Try CSV first: ts_us,gx,gy,gz,ax,ay,az
-    if let Some(sample) = parse_imu_csv(s) {
-        return Some(sample);
-    }
-    // Try JSON: {"ts_us":..., "gyro":[...], "accel":[...]}
-    if let Some(sample) = parse_imu_json(s) {
-        return Some(sample);
-    }
-
-    warn!("Unrecognized IMU line format: {}", s);
-    None
-}
-
-fn parse_imu_csv(s: &str) -> Option<LiveImuSample> {
-    let mut it = s.split(',').map(str::trim);
-    let ts_us = u64::from_str(it.next()?).ok()?;
-    let gx = f32::from_str(it.next()?).ok()?;
-    let gy = f32::from_str(it.next()?).ok()?;
-    let gz = f32::from_str(it.next()?).ok()?;
-    let ax = f32::from_str(it.next()?).ok()?;
-    let ay = f32::from_str(it.next()?).ok()?;
-    let az = f32::from_str(it.next()?).ok()?;
-    Some(LiveImuSample {
-        ts_sensor_us: ts_us,
-        gyro: [gx, gy, gz],
-        accel: [ax, ay, az],
-    })
-}
-
-fn parse_imu_json(s: &str) -> Option<LiveImuSample> {
-    #[derive(serde::Deserialize)]
-    struct JsonImu<'a> {
-        #[serde(rename = "ts_us")]
-        ts_us: Option<u64>,
-        gyro: Option<[f32; 3]>,
-        #[serde(alias = "accl", alias = "acc", alias = "accelerometer")]
-        accel: Option<[f32; 3]>,
-        // tolerate keys in unknown casing
-        #[allow(dead_code)]
-        #[serde(flatten)]
-        _rest: std::collections::HashMap<&'a str, serde_json::Value>,
-    }
-    let v: JsonImu = serde_json::from_str(s).ok()?;
-    Some(LiveImuSample {
-        ts_sensor_us: v.ts_us?,
-        gyro: v.gyro?,
-        accel: v.accel?,
-    })
-}
-
-// -------------------- TCP READER THREAD --------------------
-
-fn spawn_imu_reader(port: u16) -> std::io::Result<Receiver<LiveImuSample>> {
-    let (tx, rx) = mpsc::channel::<LiveImuSample>();
-
-    // Spawn a thread that connects and streams
+fn spawn_line_reader<T: Send + 'static>(
+    name: &'static str,
+    addr: &'static str,
+    tx: mpsc::Sender<T>,
+    stop: Arc<AtomicBool>,
+    parse_line: fn(&str) -> Option<T>,
+) {
     thread::Builder::new()
-        .name("imu_tcp_reader".into())
+        .name(format!("reader_{name}"))
         .spawn(move || {
-            let addr = format!("127.0.0.1:{port}");
-            loop {
-                match TcpStream::connect(&addr) {
+            while !stop.load(Ordering::Relaxed) {
+                match TcpStream::connect(addr) {
                     Ok(stream) => {
-                        info!("Connected to IMU at {}", addr);
-                        if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(250))) {
-                            warn!("set_read_timeout failed: {e}");
-                        }
+                        eprintln!("[{name}] connected to {addr}");
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
                         let reader = BufReader::new(stream);
+
                         for line in reader.lines() {
+                            if stop.load(Ordering::Relaxed) {
+                                eprintln!("[{name}] stop requested");
+                                return;
+                            }
                             match line {
                                 Ok(l) => {
-                                    if let Some(sample) = parse_imu_line(&l) {
-                                        if tx.send(sample).is_err() {
-                                            error!("imu_reader: consumer gone; exiting");
+                                    if let Some(msg) = parse_line(l.trim()) {
+                                        if tx.send(msg).is_err() {
+                                            eprintln!("[{name}] main loop dropped; exiting");
                                             return;
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    // Timeout or EOF → try to reconnect
-                                    warn!("imu_reader: read error: {e}; reconnecting in 500ms");
-                                    thread::sleep(Duration::from_millis(500));
-                                    break;
+                                    eprintln!("[{name}] read error: {e}. Reconnecting...");
+                                    thread::sleep(Duration::from_millis(300));
+                                    break; // break the for-loop → reconnect
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to connect to IMU at {}: {}; retrying…", addr, e);
+                        eprintln!("[{name}] connect failed: {e}. Retrying...");
                         thread::sleep(Duration::from_millis(500));
                     }
                 }
             }
-        })?;
-
-    Ok(rx)
+            eprintln!("[{name}] thread exit");
+        })
+        .expect("spawn reader thread");
 }
 
-// -------------------- MAIN RUNTIME --------------------
-
-fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    info!("Starting live IMU + stabilization runtime");
-
-    // 1) Spin up the IMU reader
-    let imu_rx = match spawn_imu_reader(IMUport) {
-        Ok(rx) => rx,
-        Err(e) => {
-            eprintln!("Failed to spawn IMU reader: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // 2) Create the manager in LIVE mode
-    // NOTE: replace new_with_live() with your real constructor if different
-    let mut stab = StablizerManager::new_with_live();
-
-    // 3) Main loop: pump IMU → ring, every 0.5s integrate + generate stmaps
-    let mut last_integrate = Instant::now();
-    let integrate_period = Duration::from_millis(500);
-
-    loop {
-        // Non-blocking-ish IMU receive; drain quickly so we keep up
-        // Use try_recv in a small burst to batch
-        for _ in 0..1024 {
-            match imu_rx.try_recv() {
-                Ok(sample) => {
-                    // Push to your live ring through the manager
-                    // If your API differs, change here:
-                    stab.push_live_sample(sample);
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    break;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    error!("IMU channel disconnected; exiting");
-                    return;
-                }
-            }
-        }
-
-        // Tick every 0.5 s: integrate and then generate STMaps
-        if last_integrate.elapsed() >= integrate_period {
-            last_integrate = Instant::now();
-
-            // 3a) integrate latest IMU window into quaternion timeline
-            stab.integrate_live_data();
-            // Validate quickly via logs
-            debug!("Integrated live IMU window");
-
-            // 3b) generate live STMaps (implementation to be provided later)
-            stab.generate_stmaps_live();
-            debug!("Generated live STMaps");
-        }
-
-        // Small sleep to avoid a busy loop (tune as needed)
-        thread::sleep(Duration::from_millis(2));
-    }
+fn parse_imu_line(line: &str) -> option<LiveImuSample>{
+    //ill now the structure later
 }

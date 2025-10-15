@@ -194,6 +194,17 @@ impl QuatBufferStore {
         Some((chosen_arc, ver))
     }
 
+    pub fn get_quat_at_time(
+    &self,
+    t_ms: f64,
+    pre_ms: f64,
+    post_ms: f64,
+    center_ratio: f64,
+) -> Option<Quat64> {
+    let (buf, _ver) = self
+        .select_centered_and_prune(t_ms, pre_ms, post_ms, center_ratio, true)?;
+    buf.quat_at_ms(t_ms)
+}
 
 }
 
@@ -203,6 +214,7 @@ pub struct LiveState {
     pub header: String,
     pub ring: ImuRing,
     pub sync: LiveClockSync,
-    pub quat_buffer_store: QuatBufferStore, 
+    pub quat_buffer_store_org: QuatBufferStore,
+    pub quat_buffer_store_smoothed: QuatBufferStore,
     pub enabled: bool,
 }

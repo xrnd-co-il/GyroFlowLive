@@ -171,7 +171,8 @@ impl StabilizationManager {
         self.keyframes.write().clear();
     }
 
-    pub fn load_gyro_data<F: Fn(f64)>(&self, url: &str, is_main_video: bool, options: &gyro_source::FileLoadOptions, progress_cb: F, cancel_flag: Arc<AtomicBool>) -> std::result::Result<(), GyroflowCoreError> {
+    pub fn load_gyro_data<F: Fn(f64)>(&self, url: &str, is_main_video: bool, options: &gyro_source::FileLoadOptions, progress_cb: F, cancel_flag: Arc<AtomicBool>) -> std::result::Result<(), GyroflowCoreError> 
+    {
         if url == "live" || url.starts_with("live:") {
             // Initialize live IMU streaming for real-time stabilization
             let fps = self.params.read().fps;

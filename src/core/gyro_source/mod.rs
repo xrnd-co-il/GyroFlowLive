@@ -24,6 +24,8 @@ use crate::stabilization_params::ReadoutDirection;
 use crate::filesystem;
 
 use live::LiveImuSample;
+use live::QuatBuffer;
+use live::QuatBufferStore;
 
 use super::imu_integration::*;
 use super::smoothing::SmoothingAlgorithm;
@@ -136,7 +138,8 @@ impl GyroSource {
             header: make_header(video_fps),              // use actual video FPS
             ring: live::ImuRing::new((keep_seconds * 1_000_000.0) as i64),
             sync: live::LiveClockSync { a, b },
-            quat_buffer_store: live::QuatBufferStore::new(),
+            quat_buffer_store_org: live::QuatBufferStore::new(),
+            quat_buffer_store_smoothed: live::QuatBufferStore::new(),
             enabled: true,
         });
     }
@@ -152,66 +155,72 @@ impl GyroSource {
     }
 
     pub fn integrate_live_data(&mut self) {
-        // Only proceed if live mode is active
-        let live_opt = self.live.read();
-        if live_opt.is_none() {
-            return;
-        }
-        // Clone the IMU samples from the ring buffer to work on (avoid holding lock during heavy computation)
-        let live_state = live_opt.as_ref().unwrap();
-        let samples: Vec<LiveImuSample> = live_state.ring.buf.iter().copied().collect();
-        drop(live_opt);  // release the read lock
-
-        if samples.is_empty() {
-            log::warn!("No IMU samples available for live integration");
-            return;
-        }
-
-        // Convert LiveImuSample data into TimeIMU (telemetry_parser::IMUData) for integration
-        let mut imu_data_vec: Vec<TimeIMU> = Vec::with_capacity(samples.len());
-        for s in &samples {
-            let mut imu_point = TimeIMU::default();
-            imu_point.timestamp_ms = s.ts_sensor_us as f64 / 1000.0;
-            imu_point.gyro = Some(s.gyro);
-            imu_point.accl = s.accel;
-            imu_data_vec.push(imu_point);
-        }
-        // Determine the time span of these samples (for integrator scaling)
-        let start_ms = imu_data_vec.first().unwrap().timestamp_ms;
-        let end_ms   = imu_data_vec.last().unwrap().timestamp_ms;
-        let duration_ms = end_ms - start_ms;
-
-        // Integrate gyroscope (and accelerometer) data to compute orientation quaternions
-        //the quat is sorted by time.
-        let quat_map: TimeQuat = match self.integration_method {
-            1 => ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms),
-            2 => VQFIntegrator::integrate(&imu_data_vec, duration_ms),
-            3 => SimpleGyroIntegrator::integrate(&imu_data_vec, duration_ms),
-            4 => SimpleGyroAccelIntegrator::integrate(&imu_data_vec, duration_ms),
-            5 => MahonyIntegrator::integrate(&imu_data_vec, duration_ms),
-            6 => MadgwickIntegrator::integrate(&imu_data_vec, duration_ms),
-            0 | _ => {  // 0 or unknown: fallback
-                log::info!("Using Complementary filter for live data (fallback)");
-                ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms)
-            }
-        };
-
-        if let Some(st) = self.live.write().as_mut() {
-            st.quat_buffer_store.publish(buf) //need to be done
-        }
-        
-        // For now, use the same quaternions as "smoothed" baseline (smoothing applied in next step if needed)
-        if self.quaternions.len() >= 2 {
-            // Smooth the most recent orientation with the previous one
-            if let Some((last_ts, last_q)) = self.quaternions.iter().next_back() {
-                if let Some((prev_ts, prev_q)) = self.quaternions.range(..*last_ts).next_back() {
-                    // Slerp 50% towards the previous orientation to dampen quick changes
-                    let blended = prev_q.slerp(last_q, 0.5);
-                    self.smoothed_quaternions.insert(*last_ts, blended);
-                }
-            }
-        }
+    // 0) Live enabled?
+    let live_opt = self.live.read();
+    if live_opt.is_none() {
+        return;
     }
+    // 1) Copy IMU window out of ring (no heavy work under lock)
+    let live_state = live_opt.as_ref().unwrap();
+    let samples: Vec<LiveImuSample> = live_state.ring.buf.iter().copied().collect();
+    drop(live_opt);
+
+    if samples.is_empty() {
+        log::warn!("No IMU samples available for live integration");
+        return;
+    }
+
+    // 2) Convert to TimeIMU (telemetry_parser::IMUData)
+    let mut imu_data_vec: Vec<TimeIMU> = Vec::with_capacity(samples.len());
+    for s in &samples {
+        let mut imu_point = TimeIMU::default();
+        imu_point.timestamp_ms = s.ts_sensor_us as f64 / 1000.0;
+        imu_point.gyro  = Some(s.gyro);   // if s.gyro is [f32;3], cast to f64 here
+        imu_point.accl  = s.accel;        // same note as above
+        imu_data_vec.push(imu_point);
+    }
+
+    let start_ms   = imu_data_vec.first().unwrap().timestamp_ms;
+    let end_ms     = imu_data_vec.last().unwrap().timestamp_ms;
+    let duration_ms = end_ms - start_ms;
+
+    // 3) Integrate → quats (sorted by timestamp)
+    let quat_map: TimeQuat = match self.integration_method {
+        1 => ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms),
+        2 => VQFIntegrator::integrate(&imu_data_vec, duration_ms),
+        3 => SimpleGyroIntegrator::integrate(&imu_data_vec, duration_ms),
+        4 => SimpleGyroAccelIntegrator::integrate(&imu_data_vec, duration_ms),
+        5 => MahonyIntegrator::integrate(&imu_data_vec, duration_ms),
+        6 => MadgwickIntegrator::integrate(&imu_data_vec, duration_ms),
+        0 | _ => {
+            log::info!("Using Complementary filter for live data (fallback)");
+            ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms)
+        }
+    };
+
+    // 4) Build a tiny smoothed map (example: blend last with previous)
+    let mut smoothed_quat_map = BTreeMap::new();
+    let mut prev_opt: Option<(&i64, &Quat64)> = None;
+
+    for (ts, q) in &quat_map {
+        if let Some((_, prev_q)) = prev_opt {
+            let blended = prev_q.slerp(*q, 0.5);
+            smoothed_quat_map.insert(*ts, blended);
+        }
+        prev_opt = Some((ts, q));
+    }
+
+    // 5) Convert both to QuatBuffer (use your associated function)
+    let buf_org       = QuatBuffer::from_btreemap(quat_map);
+    let buf_smoothed  = QuatBuffer::from_btreemap(smoothed_quat_map);
+
+    // 6) Publish both with a single write lock
+    if let Some(st) = self.live.write().as_mut() {
+        st.quat_buffer_store_org.publish(buf_org);
+        st.quat_buffer_store_smoothed.publish(buf_smoothed);
+    }
+}
+
     /* end live handling */
 
     pub fn init_from_params(&mut self, stabilization_params: &StabilizationParams) {
@@ -904,8 +913,47 @@ impl GyroSource {
     Quat64::identity()
 }
 
-    pub fn      org_quat_at_timestamp(&self, timestamp_ms: f64) -> Quat64 { self.quat_at_timestamp(&self.quaternions,          timestamp_ms) }
-    pub fn smoothed_quat_at_timestamp(&self, timestamp_ms: f64) -> Quat64 { self.quat_at_timestamp(&self.smoothed_quaternions, timestamp_ms) }
+   pub fn org_quat_at_timestamp(&self, timestamp_ms: f64) -> Quat64 {
+    // Apply video↔IMU sync correction
+    let corrected_ms = timestamp_ms - self.offset_at_video_timestamp(timestamp_ms);
+
+    // Try live path first (if enabled)
+    if let Some(st) = self.live.read().as_ref() {
+        // tuning knobs
+        const PRE_MS: f64 = 0.0;
+        const POST_MS: f64 = 500.0;
+        const CENTER_RATIO: f64 = 0.25;
+
+        if let Some(q) = st
+            .quat_buffer_store_org
+            .get_quat_at_time(corrected_ms, PRE_MS, POST_MS, CENTER_RATIO)
+        {
+            return q;
+        }
+    }
+
+    // Fallback to the offline/legacy map
+    self.quat_at_timestamp(&self.quaternions, timestamp_ms)
+}
+
+pub fn smoothed_quat_at_timestamp(&self, timestamp_ms: f64) -> Quat64 {
+    let corrected_ms = timestamp_ms - self.offset_at_video_timestamp(timestamp_ms);
+
+    if let Some(st) = self.live.read().as_ref() {
+        const PRE_MS: f64 = 0.0;
+        const POST_MS: f64 = 500.0;
+        const CENTER_RATIO: f64 = 0.25;
+
+        if let Some(q) = st
+            .quat_buffer_store_smoothed
+            .get_quat_at_time(corrected_ms, PRE_MS, POST_MS, CENTER_RATIO)
+        {
+            return q;
+        }
+    }
+
+    self.quat_at_timestamp(&self.smoothed_quaternions, timestamp_ms)
+}
 
     pub fn offset_at_timestamp(offsets: &BTreeMap<i64, f64>, timestamp_ms: f64) -> f64 {
         match offsets.len() {

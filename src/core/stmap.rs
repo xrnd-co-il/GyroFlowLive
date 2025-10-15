@@ -12,7 +12,7 @@ pub fn generate_stmaps(stab: &StabilizationManager, per_frame: bool) -> impl Ite
     };
 
 
-    //formates the filename base.
+    //formates the filename base. 
     let filename_base = {
         let lens = stab.lens.read();
         format!("{}-{}-{}-{}", crate::filesystem::get_filename(&stab.input_file.read().url), lens.camera_brand, lens.camera_model, lens.lens_model)
