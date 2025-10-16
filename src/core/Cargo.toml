@@ -10,6 +10,9 @@ name = "gyroflow_core"
 path = "lib.rs"
 
 [dependencies]
+#live
+crossbeam-channel = "0.5"
+
 #telemetry-parser = { path = "../../../telemetry-parser" }
 telemetry-parser = { git = "https://github.com/AdrianEddy/telemetry-parser.git", rev = "cbc61ab" }
 #ahrs = { version = "0.5.0", features = ["field_access"] }

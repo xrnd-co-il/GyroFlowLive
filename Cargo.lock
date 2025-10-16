@@ -1762,6 +1762,7 @@ dependencies = [
  "ciborium",
  "core-foundation-sys",
  "crc32fast",
+ "crossbeam-channel",
  "cv-core",
  "cv-pinhole",
  "dyn-clone",

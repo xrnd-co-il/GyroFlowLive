@@ -4,4 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gyroflow-core = { path = "C:\\git\\gyroflow\\src\\core" }
+crossbeam-channel = "0.5"
+gyroflow-core = { path = "C:\\git\\GyroFlowLive\\src\\core" }
+serde_json = "1.0.145"

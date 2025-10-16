@@ -23,9 +23,9 @@ use crate::camera_identifier::CameraIdentifier;
 use crate::stabilization_params::ReadoutDirection;
 use crate::filesystem;
 
-use live::LiveImuSample;
-use live::QuatBuffer;
-use live::QuatBufferStore;
+pub use live::LiveImuSample;
+pub use live::QuatBuffer;
+pub use live::QuatBufferStore;
 
 use super::imu_integration::*;
 use super::smoothing::SmoothingAlgorithm;
@@ -148,9 +148,15 @@ impl GyroSource {
         *self.live.write() = None;
     }
 
-    pub fn push_live_imu(&self, ts_sensor_us: i64, gyro: [f64;3], accel: Option<[f64;3]>, now_video_us: i64) {
+    /*pub fn push_live_imu(&self, ts_sensor_us: i64, gyro: [f64;3], accel: Option<[f64;3]>, now_video_us: i64) {
         if let Some(st) = self.live.write().as_mut() {
             st.ring.push(live::LiveImuSample { ts_sensor_us, gyro, accel }, now_video_us, &st.sync);
+        }
+    }*/
+
+    pub fn push_live_imu(&self, sample: live::LiveImuSample, now_video_us: i64) {
+        if let Some(st) = self.live.write().as_mut() {
+            st.ring.push(sample, now_video_us, &st.sync);
         }
     }
 
@@ -204,20 +210,20 @@ impl GyroSource {
 
     for (ts, q) in &quat_map {
         if let Some((_, prev_q)) = prev_opt {
-            let blended = prev_q.slerp(*q, 0.5);
+            let blended = prev_q.slerp(&q, 0.5);
             smoothed_quat_map.insert(*ts, blended);
         }
         prev_opt = Some((ts, q));
     }
 
     // 5) Convert both to QuatBuffer (use your associated function)
-    let buf_org       = QuatBuffer::from_btreemap(quat_map);
-    let buf_smoothed  = QuatBuffer::from_btreemap(smoothed_quat_map);
+    let buf_org       = QuatBuffer::from_btreemap(&quat_map);
+    let buf_smoothed  = QuatBuffer::from_btreemap(&smoothed_quat_map);
 
     // 6) Publish both with a single write lock
     if let Some(st) = self.live.write().as_mut() {
-        st.quat_buffer_store_org.publish(buf_org);
-        st.quat_buffer_store_smoothed.publish(buf_smoothed);
+        st.quat_buffer_store_org.publish(buf_org.unwrap());
+        st.quat_buffer_store_smoothed.publish(buf_smoothed.unwrap());
     }
 }
 

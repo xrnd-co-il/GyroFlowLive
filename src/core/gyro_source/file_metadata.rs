@@ -56,6 +56,7 @@ pub struct FileMetadata {
     pub camera_stab_data:    Vec<CameraStabData>,
     pub mesh_correction:     Vec<(Vec<f64>, Vec<f32>)>,
 }
+
 impl FileMetadata {
     pub fn thin(&self) -> Self {
         Self {

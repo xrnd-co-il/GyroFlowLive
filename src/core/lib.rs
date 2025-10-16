@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use keyframes::*;
 use parking_lot::{ RwLock, RwLockUpgradableReadGuard };
 use nalgebra::Vector4;
-use gyro_source::{ GyroSource, Quat64, TimeQuat, TimeVec };
+use gyro_source::{ GyroSource, Quat64, TimeQuat, TimeVec, FileMetadata };
 use stabilization_params::{ ReadoutDirection, StabilizationParams };
 use lens_profile::LensProfile;
 use lens_profile_database::LensProfileDatabase;
@@ -280,7 +280,105 @@ impl StabilizationManager {
         }
         Ok(())
     }
+    /* start of live handling for the stabilzation manager */
+    pub fn start_live_gyro(
+        &self,
+        keep_secs: f64,   // e.g., 3.0
+        a_sync:   f64,    // e.g., 1.0
+        b_sync:   f64,    // e.g., 0.0
+    ) -> Result<(), GyroflowCoreError> {
+        // Read current FPS from params to keep behavior consistent with file mode
+        let fps = self.params.read().fps;
 
+        {
+            // Re-init & clear so state is fresh (mirrors the file path’s housekeeping)
+            let params = self.params.read();
+            let mut gyro = self.gyro.write();
+
+            gyro.init_from_params(&params);
+            gyro.clear();
+
+            // For visibility/debugging: mark the source as "live"
+            gyro.file_url = "live".to_string();
+            gyro.file_metadata = Default::default();
+
+            // Enable the live ring buffer
+            gyro.enable_live(keep_secs, a_sync, b_sync, fps);
+        }
+
+        // Invalidate caches so downstream recomputes with the live source
+        self.invalidate_smoothing();
+        self.invalidate_zooming();
+        // self.undistortion_invalidated.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // --- LATER: set defaults that file metadata usually provides ---
+        // self.params.write().frame_readout_direction = ReadoutDirection::TopToBottom;
+        // self.params.write().frame_readout_time = 0.0;
+        // *self.camera_id.write() = Some("live-camera-1".to_string());
+        // let mut l = self.lens.write(); *l = LensProfile::default(); // or resolve from DB
+
+        log::info!("Live IMU mode enabled (keep={keep_secs}s, a={a_sync}, b={b_sync}, fps={fps})");
+        Ok(())
+    }
+
+    pub fn start_single_stream(&self, 
+        metadata: FileMetadata,
+        keep_secs: f64,   // e.g., 3.0
+        a_sync:   f64,    // e.g., 1.0
+        b_sync:   f64)  -> Result<(), GyroflowCoreError> 
+        {
+        // Initialize the gyro source
+        let fps = self.params.read().fps;
+        {
+            let mut gyro = self.gyro.write();
+            gyro.clear();
+            gyro.enable_live(keep_secs, a_sync, b_sync, fps); // 3s ring buffer
+            gyro.file_metadata = ReadOnlyFileMetadata::from(metadata.clone());
+        }
+
+        //  Apply metadata to the stabilizer params
+        let mut params = self.params.write();
+        params.frame_readout_time = metadata.frame_readout_time.unwrap_or_default();
+        params.frame_readout_direction = metadata.frame_readout_direction;
+        params.fps = metadata.frame_rate.unwrap_or(params.fps);
+        //no need for frame count
+        //params.frame_count = (metadata.frame_rate.unwrap_or(params.fps) * metadata.duration_ms.unwrap_or(0.0) / 1000.0) as usize;
+
+        // Apply lens and camera info
+        if let Some(lens_json) = &self.gyro.read().file_metadata.read().lens_profile {
+            let mut lens = self.lens.write();
+            lens.load_from_json_value(&lens_json);
+            lens.resolve_interpolations(&self.lens_profile_db.read());
+        }
+
+        // Reset internal states
+        self.invalidate_smoothing();
+        self.invalidate_zooming();
+
+        Ok(())
+    }
+
+    pub fn live_on_new_frame(&self, frame_idx: usize, now_ms: f64, recompute_period: usize) {
+        // keep params timeline in sync
+        {
+            let mut p = self.params.write();
+            p.frame_count = frame_idx.max(p.frame_count);
+            p.duration_ms = now_ms.max(p.duration_ms);
+        }
+
+        // update IMU transforms if GUI changed
+        // self.recompute_gyro();  // only if needed
+
+        // occasional (or per-N-frames) heavy recompute:
+        if frame_idx % recompute_period == 0{
+            self.recompute_smoothness();
+            self.recompute_adaptive_zoom();
+            self.recompute_undistortion();
+        }
+        
+    }
+
+    /* end of live helper functions + handling */
     pub fn load_lens_profile(&self, url: &str) -> Result<(), crate::GyroflowCoreError> {
         let url = if (url.starts_with('/') || url.starts_with('\\') || (url.len() > 3 && &url[1..2] == ":")) && !url.contains("://") && !url.starts_with('{') {
             crate::filesystem::path_to_url(url)
@@ -1924,6 +2022,8 @@ pub fn run_threaded<F>(cb: F) where F: FnOnce() + Send + 'static {
 }
 
 use std::str::FromStr;
+
+use crate::gyro_source::ReadOnlyFileMetadata;
 #[derive(Debug, Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub enum GyroflowProjectType {
     Simple,

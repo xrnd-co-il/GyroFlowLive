@@ -470,6 +470,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -941,6 +950,7 @@ dependencies = [
  "ciborium",
  "core-foundation-sys",
  "crc32fast",
+ "crossbeam-channel",
  "cv-core",
  "cv-pinhole",
  "dyn-clone",
@@ -1376,7 +1386,9 @@ checksum = "f5e54036fe321fd421e10d732f155734c4e4afd610dd556d9a82833ab3ee0bed"
 name = "live"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "gyroflow-core",
+ "serde_json",
 ]
 
 [[package]]
