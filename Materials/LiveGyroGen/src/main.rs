@@ -49,7 +49,7 @@ fn advance_vector(
 
 fn main() -> std::io::Result<()> {
     // --- Config ---
-    const PORT: u16 = 5555; // change as needed
+    const PORT: u16 = 7007; // change as needed
     let period_hz: f64 = 30.0;
     let period = 1.0 / period_hz;
     let dt_sim = 0.01;

@@ -1,13 +1,13 @@
 // gyro_source/live.rs
 use std::collections::VecDeque;
-use parking_lot::RwLock;   
+use parking_lot::{RwLock, Mutex};   
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use crossbeam_channel::{unbounded, Sender, Receiver};
 use super::FileMetadata;
 use super::TimeQuat;
 use super::Quat64;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
 
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +31,26 @@ pub struct ImuRing {
 }
 
 
+impl fmt::Display for LiveImuSample {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.accel {
+            Some(a) => write!(
+                f,
+                "LiveImuSample {{ ts_sensor_us: {}, gyro: [{:.3}, {:.3}, {:.3}], accel: [{:.3}, {:.3}, {:.3}] }}",
+                self.ts_sensor_us,
+                self.gyro[0], self.gyro[1], self.gyro[2],
+                a[0], a[1], a[2]
+            ),
+            None => write!(
+                f,
+                "LiveImuSample {{ ts_sensor_us: {}, gyro: [{:.3}, {:.3}, {:.3}], accel: None }}",
+                self.ts_sensor_us,
+                self.gyro[0], self.gyro[1], self.gyro[2]
+            ),
+        }
+    }
+}
+
 
 impl ImuRing {
     pub fn new(keep_us: i64) -> Self { Self { buf: VecDeque::new(), keep_us } }
@@ -47,6 +67,11 @@ impl ImuRing {
     pub fn window(&self, start_us: i64, end_us: i64) -> impl Iterator<Item=&LiveImuSample> {
         self.buf.iter().filter(move |s| s.ts_sensor_us >= start_us && s.ts_sensor_us <= end_us)
     }
+    pub fn snapshot(&self) -> Vec<LiveImuSample> {
+        self.buf.iter().copied().collect()
+    }
+
+
 
 
 }
@@ -128,7 +153,7 @@ impl QuatBufferStore {
     pub fn publish(&self, buf: QuatBuffer) -> (Arc<QuatBuffer>, u64) {
         let arc = Arc::new(buf);
         {
-            let mut w = self.dq.write();
+            let mut w: parking_lot::lock_api::RwLockWriteGuard<'_, parking_lot::RawRwLock, VecDeque<Arc<QuatBuffer>>> = self.dq.write();
             w.push_back(arc.clone());
         }
         let ver = self.version.fetch_add(1, Ordering::SeqCst) + 1;
@@ -218,12 +243,26 @@ impl QuatBufferStore {
 }
 
 
-#[derive(Default)]
+
 pub struct LiveState {
     pub header: String,
-    pub ring: ImuRing,
+    pub ring: Mutex<ImuRing>,
     pub sync: LiveClockSync,
     pub quat_buffer_store_org: QuatBufferStore,
     pub quat_buffer_store_smoothed: QuatBufferStore,
-    pub enabled: bool,
+    pub enabled: AtomicBool,
+}
+
+impl Default for LiveState {
+     fn default() -> Self {
+         Self {
+             header: String::new(),
+             // default keep_us=3s; enable_live will override when constructing
+             ring: Mutex::new(ImuRing::new(3_000_000)),
+             sync: LiveClockSync::default(),
+             quat_buffer_store_org: QuatBufferStore::new(),
+             quat_buffer_store_smoothed: QuatBufferStore::new(),
+             enabled: AtomicBool::new(false),
+         }
+     }
 }

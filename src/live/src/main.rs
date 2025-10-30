@@ -1,9 +1,11 @@
 use std::io::{BufRead, BufReader};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde_json::json;
@@ -22,9 +24,7 @@ fn main() {
     let stab_man = Arc::new(StabilizationManager::default());
     let metadata: FileMetadata = FileMetadata::default();
 
-    // If you implemented this helper in your core:
-    // start live ring, metadata, keep_secs=3.0, a=1.0, b=0.0
-    // If you don't have this method, call start_live_gyro directly.
+    // Initialize live ring (3s retention; scale placeholders a=1./0, b=0.0)
     let _ = stab_man.start_single_stream(metadata, 3.0, 1.0, 0.0);
     // let _ = stab_man.start_live_gyro(3.0, 1.0, 0.0);
 
@@ -34,38 +34,38 @@ fn main() {
     // Crossbeam channel (Sender, Receiver)
     let (imu_tx, imu_rx) = unbounded::<LiveImuSample>();
 
-    // Spawn reader thread (connects to the IMU generator and parses lines)
-    spawn_line_reader::<LiveImuSample>("imu thread", IMU_ADDR, imu_tx, Arc::clone(&stop), parse_imu_line);
+    // Spawn server thread (binds and waits for generator to connect and write)
+    spawn_line_server::<LiveImuSample>("imu server", IMU_ADDR, imu_tx, Arc::clone(&stop), parse_imu_line);
 
     // Spawn consumer thread: pull samples from channel and push into GyroSource
     {
         let stab = Arc::clone(&stab_man);
         thread::spawn(move || {
             while let Ok(imu_sample) = imu_rx.recv() {
-                // destructure
-                let LiveImuSample { ts_sensor_us, gyro, accel } = imu_sample;
-
-                // If you have a video clock, pass it; for now reuse sensor time
+                let LiveImuSample { ts_sensor_us, .. } = imu_sample;
+                // If you have a video clock, pass it; reusing sensor time for now
                 let now_video_us = ts_sensor_us;
-
-                // Push into the live ring
-                // NOTE: this assumes you have: fn push_live_imu(&self, ts, gyro, accel, now_video_us)
-                // If your method signature is different, adapt here.
+                //println!("Received IMU sample at ts_sensor_us={}", imu_sample);
+                //working :)
                 let mut g = stab.gyro.write();
                 g.push_live_imu(imu_sample, now_video_us);
             }
         });
     }
 
-    // Keep main alive (demo); in a real app handle shutdowns, signals, etc.
+    // Keep main alive; periodically integrate live data
     loop {
         thread::sleep(Duration::from_millis(500));
         stab_man.gyro.write().integrate_live_data();
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
     }
 }
 
-/// Generic TCP line reader: connects, reads lines, parses with `parse_line`, sends to `tx`
-fn spawn_line_reader<T: Send + 'static>(
+/// TCP line **server**: bind(addr) and accept() clients; for each client,
+/// read lines, parse with `parse_line`, and send to `tx`.
+fn spawn_line_server<T: Send + 'static>(
     name: &'static str,
     addr: &'static str,
     tx: Sender<T>,
@@ -73,46 +73,88 @@ fn spawn_line_reader<T: Send + 'static>(
     parse_line: fn(&str) -> Option<T>,
 ) {
     thread::Builder::new()
-        .name(format!("reader_{name}"))
+        .name(format!("server_{name}"))
         .spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                match TcpStream::connect(addr) {
-                    Ok(stream) => {
-                        eprintln!("[{name}] connected to {addr}");
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-                        let reader = BufReader::new(stream);
+            // Bind once; if bind fails, crash early so the operator knows
+            let listener = match TcpListener::bind(addr) {
+                Ok(l) => {
+                    eprintln!("[{name}] listening on {addr}");
+                    l
+                }
+                Err(e) => {
+                    eprintln!("[{name}] failed to bind {addr}: {e}");
+                    return;
+                }
+            };
 
-                        for line in reader.lines() {
-                            if stop.load(Ordering::Relaxed) {
-                                eprintln!("[{name}] stop requested");
-                                return;
-                            }
-                            match line {
-                                Ok(l) => {
-                                    if let Some(msg) = parse_line(l.trim()) {
-                                        if tx.send(msg).is_err() {
-                                            eprintln!("[{name}] main loop dropped; exiting");
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[{name}] read error: {e}. Reconnecting...");
-                                    thread::sleep(Duration::from_millis(300));
-                                    break; // break the for-loop → reconnect
-                                }
-                            }
+            // Accept-loop: handle one client at a time; when it disconnects, accept the next one
+            listener
+                .set_nonblocking(false)
+                .ok(); // blocking accept is fine here
+
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, peer)) => {
+                        eprintln!("[{name}] client connected from {peer}");
+                        if let Err(e) = handle_client(name, stream.try_clone().unwrap(), &tx, &stop, parse_line) {
+                            eprintln!("[{name}] client handler error: {e}");
                         }
+                        eprintln!("[{name}] client disconnected");
                     }
                     Err(e) => {
-                        eprintln!("[{name}] connect failed: {e}. Retrying...");
-                        thread::sleep(Duration::from_millis(500));
+                        eprintln!("[{name}] accept error: {e}");
+                        thread::sleep(Duration::from_millis(200));
                     }
                 }
             }
-            eprintln!("[{name}] thread exit");
+
+            eprintln!("[{name}] server exit");
         })
-        .expect("spawn reader thread");
+        .expect("spawn server thread");
+}
+
+/// Handle a single connected client: read lines → parse → send
+fn handle_client<T: Send>(
+    name: &str,
+    stream: TcpStream,
+    tx: &Sender<T>,
+    stop: &Arc<AtomicBool>,
+    parse_line: fn(&str) -> Option<T>,
+) -> std::io::Result<()> {
+    // Optional read timeout so we periodically check `stop`
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let reader = BufReader::new(stream);
+
+    for maybe_line in reader.lines() {
+        if stop.load(Ordering::Relaxed) {
+            eprintln!("[{name}] stop requested");
+            break;
+        }
+        match maybe_line {
+            Ok(l) => {
+                let line = l.trim();
+                if let Some(msg) = parse_line(line) {
+                    if tx.send(msg).is_err() {
+                        eprintln!("[{name}] main loop dropped; exiting client handler");
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                // Timeout or IO error; on timeout continue, else break
+                // (on Windows, timeouts often appear as WouldBlock/TimedOut)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                {
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Simple parser that accepts "t,gx,gy,gz,ax,ay,az"
@@ -133,6 +175,8 @@ fn parse_imu_line(line: &str) -> Option<LiveImuSample> {
     let ax = it.next()?.trim().parse::<f64>().ok()?;
     let ay = it.next()?.trim().parse::<f64>().ok()?;
     let az = it.next()?.trim().parse::<f64>().ok()?;
+
+    //println!("Parsed IMU line: t={} gx={} gy={} gz={} ax={} ay={} az={}", t_str, gx, gy, gz, ax, ay, az);
 
     // auto-detect time column
     let ts_sensor_us: i64 = if let Ok(t_ns_big) = t_str.parse::<i128>() {

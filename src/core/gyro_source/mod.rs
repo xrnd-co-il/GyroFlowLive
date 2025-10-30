@@ -136,11 +136,11 @@ impl GyroSource {
         let mut st = self.live.write();
         *st = Some(live::LiveState {
             header: make_header(video_fps),              // use actual video FPS
-            ring: live::ImuRing::new((keep_seconds * 1_000_000.0) as i64),
+            ring: parking_lot::Mutex::new(live::ImuRing::new((keep_seconds * 1_000_000.0) as i64)),
             sync: live::LiveClockSync { a, b },
             quat_buffer_store_org: live::QuatBufferStore::new(),
             quat_buffer_store_smoothed: live::QuatBufferStore::new(),
-            enabled: true,
+            enabled: std::sync::atomic::AtomicBool::new(true),
         });
     }
 
@@ -155,8 +155,9 @@ impl GyroSource {
     }*/
 
     pub fn push_live_imu(&self, sample: live::LiveImuSample, now_video_us: i64) {
-        if let Some(st) = self.live.write().as_mut() {
-            st.ring.push(sample, now_video_us, &st.sync);
+    // pushing IMU into ring with fine-grained locking
+        if let Some(st) = self.live.read().as_ref() {
+            st.ring.lock().push(sample, now_video_us, &st.sync);
         }
     }
 
@@ -168,14 +169,20 @@ impl GyroSource {
     }
     // 1) Copy IMU window out of ring (no heavy work under lock)
     let live_state = live_opt.as_ref().unwrap();
-    let samples: Vec<LiveImuSample> = live_state.ring.buf.iter().copied().collect();
-    drop(live_opt);
+    let samples = {
+        let ring = live_state.ring.lock();
+        ring.snapshot()
+    }; // lock released
+
+    for s in &samples {
+        println!("Processing IMU sample: {}", s);
+    }
 
     if samples.is_empty() {
         log::warn!("No IMU samples available for live integration");
         return;
     }
-
+    println!("Integrating {} live IMU samples", samples.len());
     // 2) Convert to TimeIMU (telemetry_parser::IMUData)
     let mut imu_data_vec: Vec<TimeIMU> = Vec::with_capacity(samples.len());
     for s in &samples {
@@ -189,7 +196,7 @@ impl GyroSource {
     let start_ms   = imu_data_vec.first().unwrap().timestamp_ms;
     let end_ms     = imu_data_vec.last().unwrap().timestamp_ms;
     let duration_ms = end_ms - start_ms;
-
+println!("Live IMU data duration: {:.3} ms", duration_ms);
     // 3) Integrate → quats (sorted by timestamp)
     let quat_map: TimeQuat = match self.integration_method {
         1 => ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms),
@@ -203,7 +210,7 @@ impl GyroSource {
             ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms)
         }
     };
-
+    println!("Integrated {} quaternions from live IMU data", quat_map.len());
     // 4) Build a tiny smoothed map (example: blend last with previous)
     let mut smoothed_quat_map = BTreeMap::new();
     let mut prev_opt: Option<(&i64, &Quat64)> = None;
@@ -215,16 +222,19 @@ impl GyroSource {
         }
         prev_opt = Some((ts, q));
     }
+    println!("Smoothed {} quaternions for live data", smoothed_quat_map.len());
 
     // 5) Convert both to QuatBuffer (use your associated function)
     let buf_org       = QuatBuffer::from_btreemap(&quat_map);
     let buf_smoothed  = QuatBuffer::from_btreemap(&smoothed_quat_map);
 
-    // 6) Publish both with a single write lock
-    if let Some(st) = self.live.write().as_mut() {
+    //6 publish both buffers (stores are internally synchronized)
+    if let Some(st) = self.live.read().as_ref() {
         st.quat_buffer_store_org.publish(buf_org.unwrap());
         st.quat_buffer_store_smoothed.publish(buf_smoothed.unwrap());
+        println!("published live quat buffers");
     }
+    println!("Finished integrating live IMU data");
 }
 
     /* end live handling */
