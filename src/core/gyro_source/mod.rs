@@ -174,15 +174,12 @@ impl GyroSource {
         ring.snapshot()
     }; // lock released
 
-    for s in &samples {
-        println!("Processing IMU sample: {}", s);
-    }
-
+     
     if samples.is_empty() {
         log::warn!("No IMU samples available for live integration");
         return;
     }
-    println!("Integrating {} live IMU samples", samples.len());
+    //println!("Integrating {} live IMU samples", samples.len());
     // 2) Convert to TimeIMU (telemetry_parser::IMUData)
     let mut imu_data_vec: Vec<TimeIMU> = Vec::with_capacity(samples.len());
     for s in &samples {
@@ -196,7 +193,7 @@ impl GyroSource {
     let start_ms   = imu_data_vec.first().unwrap().timestamp_ms;
     let end_ms     = imu_data_vec.last().unwrap().timestamp_ms;
     let duration_ms = end_ms - start_ms;
-println!("Live IMU data duration: {:.3} ms", duration_ms);
+//println!("Live IMU data duration: {:.3} ms", duration_ms);
     // 3) Integrate → quats (sorted by timestamp)
     let quat_map: TimeQuat = match self.integration_method {
         1 => ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms),
@@ -210,7 +207,7 @@ println!("Live IMU data duration: {:.3} ms", duration_ms);
             ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms)
         }
     };
-    println!("Integrated {} quaternions from live IMU data", quat_map.len());
+    //println!("Integrated {} quaternions from live IMU data", quat_map.len());
     // 4) Build a tiny smoothed map (example: blend last with previous)
     let mut smoothed_quat_map = BTreeMap::new();
     let mut prev_opt: Option<(&i64, &Quat64)> = None;
@@ -222,7 +219,7 @@ println!("Live IMU data duration: {:.3} ms", duration_ms);
         }
         prev_opt = Some((ts, q));
     }
-    println!("Smoothed {} quaternions for live data", smoothed_quat_map.len());
+    //println!("Smoothed {} quaternions for live data", smoothed_quat_map.len());
 
     // 5) Convert both to QuatBuffer (use your associated function)
     let buf_org       = QuatBuffer::from_btreemap(&quat_map);

@@ -74,6 +74,7 @@ chrono = "0.4"
 log-panics = { version = "2.1", features = ["with-backtrace"] }
 
 keep-awake = { git = "https://github.com/AdrianEddy/keep-awake-rs.git", rev = "04ce779" }
+anyhow = "1.0.100"
 
 [patch.crates-io]
 qmetaobject = { git = "https://github.com/AdrianEddy/qmetaobject-rs.git", rev = "ff1e23d" }

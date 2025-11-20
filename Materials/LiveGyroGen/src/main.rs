@@ -66,10 +66,22 @@ fn main() -> std::io::Result<()> {
     let mut v = Vec6(aabs.0);
     let mut x = Vec6([17.0, 14.0, 19.0, -42.0, -5.0, 99.0]);
 
-    // Connect to TCP server
+    // --- Wait for server to be up ---
     let addr = format!("127.0.0.1:{}", PORT);
-    let mut stream = TcpStream::connect(&addr)?;
-    println!("Connected to {}", addr);
+    println!("Trying to connect to {addr} ...");
+
+    let mut stream = loop {
+        match TcpStream::connect(&addr) {
+            Ok(s) => {
+                println!("✅ Connected to {}", addr);
+                break s;
+            }
+            Err(e) => {
+                eprintln!("Server not ready at {addr}: {e}. Retrying in 1s...");
+                sleep(Duration::from_secs(1));
+            }
+        }
+    };
 
     // Send header once
     let tscale = if use_ns { 1.0 } else { period };

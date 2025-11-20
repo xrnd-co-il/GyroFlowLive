@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::cell::RefCell;
+use std::hash::{Hash, DefaultHasher, Hasher};
 
 use crate::GyroflowCoreError;
 
@@ -13,13 +14,14 @@ use drawing::DrawCanvas;
 mod compute_params;
 mod frame_transform;
 mod cpu_undistort;
-mod pixel_formats;
+pub mod pixel_formats;
 // mod interpolation;
 pub mod distortion_models;
 pub use pixel_formats::*;
 pub use compute_params::ComputeParams;
 pub use frame_transform::FrameTransform;
 pub use cpu_undistort::*;
+use crate::gpu;
 
 #[derive(Default, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Interpolation {
@@ -66,7 +68,7 @@ thread_local! {
 }
 
 bitflags::bitflags! {
-    #[derive(Default, Clone)]
+    #[derive(Default, Clone, Copy)]
     pub struct KernelParamsFlags: i32 {
         const FIX_COLOR_RANGE      = 1 << 0; // 1
         const HAS_DIGITAL_LENS     = 1 << 1; // 2
@@ -530,7 +532,7 @@ impl Stabilization {
                             }
                         },
                         Ok(Err(e)) => {
-                            log::error!("Failed to initialize wgpu {:?}", e);
+                            //log::error!("Failed to initialize wgpu {:?}", e);
                             if self.share_wgpu_instances { CACHED_WGPU.with(|x| x.0.borrow_mut().clear()) }
                         },
                         Err(e) => {
@@ -594,120 +596,339 @@ impl Stabilization {
             }
         }
     }
-    pub fn process_pixels<T: PixelType>(&self, timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers, frame_transform: Option<&FrameTransform>) -> Result<ProcessedInfo, GyroflowCoreError> {
-        if buffers.input.size.1 < 4 || buffers.output.size.1 < 4 { return Err(GyroflowCoreError::SizeTooSmall); }
+   pub fn process_pixels<T: PixelType>(
+    &self,
+    timestamp_us: i64,
+    frame: Option<usize>,
+    buffers: &mut Buffers,
+    frame_transform: Option<&FrameTransform>,
+) -> Result<ProcessedInfo, GyroflowCoreError> {
+    if buffers.input.size.1 < 4 || buffers.output.size.1 < 4 {
+        return Err(GyroflowCoreError::SizeTooSmall);
+    }
 
-        let mut _tmp_transform = None;
-        if frame_transform.is_none() && !self.cache_frame_transform {
-            _tmp_transform = Some(self.get_frame_transform_at::<T>(timestamp_us, frame, buffers));
-        }
-        let itm = frame_transform.map(|x| Some(x)).unwrap_or_else(||
+    let mut _tmp_transform = None;
+    if frame_transform.is_none() && !self.cache_frame_transform {
+        _tmp_transform = Some(self.get_frame_transform_at::<T>(timestamp_us, frame, buffers));
+    }
+    let itm = frame_transform
+        .map(|x| Some(x))
+        .unwrap_or_else(|| {
             if !self.cache_frame_transform {
                 _tmp_transform.as_ref()
             } else {
                 self.stab_data.get(&timestamp_us)
             }
-        );
+        });
 
-        if let Some(itm) = itm {
-            let mut ret = ProcessedInfo {
-                fov: itm.fov,
-                minimal_fov: itm.minimal_fov,
-                focal_length: itm.focal_length,
-                backend: ""
-            };
-            let drawing_buffer = self.drawing.get_buffer();
+    if let Some(itm) = itm {
+        let mut ret = ProcessedInfo {
+            fov:          itm.fov,
+            minimal_fov:  itm.minimal_fov,
+            focal_length: itm.focal_length,
+            backend:      "",
+        };
+        let drawing_buffer = self.drawing.get_buffer();
 
-            if self.size        != (itm.kernel_params.width        as usize, itm.kernel_params.height        as usize) { return Err(GyroflowCoreError::SizeMismatch(self.size, (itm.kernel_params.width        as usize, itm.kernel_params.height        as usize))); }
-            if self.output_size != (itm.kernel_params.output_width as usize, itm.kernel_params.output_height as usize) { return Err(GyroflowCoreError::SizeMismatch(self.size, (itm.kernel_params.output_width as usize, itm.kernel_params.output_height as usize))); }
-
-            if buffers.input.size.0  as i32 > itm.kernel_params.stride        { return Err(GyroflowCoreError::InvalidStride(itm.kernel_params.stride, buffers.input.size.0 as i32)); }
-            if buffers.output.size.0 as i32 > itm.kernel_params.output_stride { return Err(GyroflowCoreError::InvalidStride(itm.kernel_params.output_stride, buffers.output.size.0 as i32)); }
-
-            // OpenCL path
-            #[cfg(feature = "use-opencl")]
-            if !matches!(self.initialized_backend, BackendType::Cpu(_)) && opencl::is_buffer_supported(buffers) {
-                if self.share_wgpu_instances {
-                    let hash = self.get_current_checksum(buffers);
-                    let has_cache = CACHED_OPENCL.with(|lru| lru.borrow().contains(&hash));
-                    if has_cache {
-                        return CACHED_OPENCL.with(|x| {
-                            let mut cached = x.borrow_mut();
-                            if let Some(cl) = cached.get(&hash) {
-                                if let Err(err) = cl.undistort_image(buffers, &itm, drawing_buffer) {
-                                    log::error!("OpenCL error undistort: {:?}", err);
-                                }
-                                ret.backend = "OpenCL";
-                                Ok(ret)
-                            } else {
-                                Err(GyroflowCoreError::NoCachedWgpuInstance(self.get_current_key(buffers)))
-                            }
-                        });
-                    }
-                } else {
-                    if let Some(ref cl) = self.cl {
-                        if let Err(err) = cl.undistort_image(buffers, &itm, drawing_buffer) {
-                            log::error!("OpenCL error undistort: {:?}", err);
-                        } else {
-                            ret.backend = "OpenCL";
-                            return Ok(ret);
-                        }
-                    }
-                }
-            }
-
-            // wgpu path
-            if !matches!(self.initialized_backend, BackendType::Cpu(_)) && wgpu::is_buffer_supported(buffers) {
-                if self.share_wgpu_instances {
-                    let hash = self.get_current_checksum(buffers);
-                    let has_any_cache = CACHED_WGPU.with(|x| !x.0.borrow().is_empty());
-                    if has_any_cache {
-                        return CACHED_WGPU.with(|x| {
-                            let mut cached = x.0.borrow_mut();
-                            if let Some(wgpu) = cached.get(&hash) {
-                                wgpu.undistort_image(buffers, &itm, drawing_buffer);
-                                ret.backend = "wgpu";
-                                Ok(ret)
-                            } else {
-                                Err(GyroflowCoreError::NoCachedWgpuInstance(self.get_current_key(buffers)))
-                            }
-                        });
-                    } else {
-                        log::error!("No cached wgpu found for key: {}", self.get_current_key(buffers));
-                    }
-                } else {
-                    if let Some(ref wgpu) = self.wgpu {
-                        wgpu.undistort_image(buffers, &itm, drawing_buffer);
-                        ret.backend = "wgpu";
-                        return Ok(ret);
-                    } else {
-                        log::error!("No wgpu instance!");
-                    }
-                }
-            }
-
-            //let ok = Self::undistort_image_cpu_spirv::<T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer);
-            // CPU path
-            let ok = match self.interpolation {
-                Interpolation::Bilinear => { Self::undistort_image_cpu::<2, T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer, &itm.mesh_data) },
-                Interpolation::Bicubic  => { Self::undistort_image_cpu::<4, T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer, &itm.mesh_data) },
-                Interpolation::Lanczos4 => { Self::undistort_image_cpu::<8, T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer, &itm.mesh_data) },
-                Interpolation::RobidouxSharp => { Self::undistort_image_cpu::<10, T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer, &itm.mesh_data) },
-                Interpolation::Robidoux      => { Self::undistort_image_cpu::<11, T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer, &itm.mesh_data) },
-                Interpolation::Mitchell      => { Self::undistort_image_cpu::<12, T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer, &itm.mesh_data) },
-                Interpolation::CatmullRom    => { Self::undistort_image_cpu::<13, T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer, &itm.mesh_data) },
-            };
-            if ok {
-                ret.backend = "CPU";
-                return Ok(ret);
-            }
-        } else {
-            log::warn!("No stab data at {timestamp_us}");
-            return Err(GyroflowCoreError::NoStabilizationData(timestamp_us));
+        if self.size
+            != (itm.kernel_params.width as usize, itm.kernel_params.height as usize)
+        {
+            return Err(GyroflowCoreError::SizeMismatch(
+                self.size,
+                (itm.kernel_params.width as usize, itm.kernel_params.height as usize),
+            ));
         }
-        Err(GyroflowCoreError::Unknown)
+        if self.output_size
+            != (
+                itm.kernel_params.output_width as usize,
+                itm.kernel_params.output_height as usize,
+            )
+        {
+            return Err(GyroflowCoreError::SizeMismatch(
+                self.size,
+                (
+                    itm.kernel_params.output_width as usize,
+                    itm.kernel_params.output_height as usize,
+                ),
+            ));
+        }
+
+        if buffers.input.size.0 as i32 > itm.kernel_params.stride {
+            return Err(GyroflowCoreError::InvalidStride(
+                itm.kernel_params.stride,
+                buffers.input.size.0 as i32,
+            ));
+        }
+        if buffers.output.size.0 as i32 > itm.kernel_params.output_stride {
+            return Err(GyroflowCoreError::InvalidStride(
+                itm.kernel_params.output_stride,
+                buffers.output.size.0 as i32,
+            ));
+        }
+
+        // ---------- DEBUG: kernel + buffer snapshot before any GPU/CPU work ----------
+        /*log::info!(
+            "process_pixels: timestamp_us={:?}, frame={:?}",
+            timestamp_us,
+            frame
+        );
+        log::info!(
+            "process_pixels: buffers.input.size={:?}, buffers.output.size={:?}",
+            buffers.input.size,
+            buffers.output.size
+        );
+        log::info!(
+            "process_pixels: kernel_params: \
+             w={}, h={}, out_w={}, out_h={}, stride={}, out_stride={}, \
+             src_rect={:?}, out_rect={:?}, bpp={}, matrix_count={}, \
+             flags={}, plane_index={}, bg_mode={}",
+            itm.kernel_params.width,
+            itm.kernel_params.height,
+            itm.kernel_params.output_width,
+            itm.kernel_params.output_height,
+            itm.kernel_params.stride,
+            itm.kernel_params.output_stride,
+            itm.kernel_params.source_rect,
+            itm.kernel_params.output_rect,
+            itm.kernel_params.bytes_per_pixel,
+            itm.kernel_params.matrix_count,
+            itm.kernel_params.flags,
+            itm.kernel_params.plane_index,
+            itm.kernel_params.background_mode,
+        );
+        log::info!(
+            "process_pixels: mesh_data_len={}",
+            itm.mesh_data.len()
+        );
+        */
+        // ---------------------------------------------------------------------------
+
+        // OpenCL path
+        #[cfg(feature = "use-opencl")]
+        if !matches!(self.initialized_backend, BackendType::Cpu(_))
+            && opencl::is_buffer_supported(buffers)
+        {
+            if self.share_wgpu_instances {
+                let hash = self.get_current_checksum(buffers);
+                let has_cache = CACHED_OPENCL.with(|lru| lru.borrow().contains(&hash));
+                if has_cache {
+                    return CACHED_OPENCL.with(|x| {
+                        let mut cached = x.borrow_mut();
+                        if let Some(cl) = cached.get(&hash) {
+                            if let Err(err) = cl.undistort_image(buffers, &itm, drawing_buffer) {
+                                log::error!("OpenCL error undistort: {:?}", err);
+                            }
+                            ret.backend = "OpenCL";
+                            Ok(ret)
+                        } else {
+                            Err(GyroflowCoreError::NoCachedWgpuInstance(
+                                self.get_current_key(buffers),
+                            ))
+                        }
+                    });
+                }
+            } else if let Some(ref cl) = self.cl {
+                if let Err(err) = cl.undistort_image(buffers, &itm, drawing_buffer) {
+                    log::error!("OpenCL error undistort: {:?}", err);
+                } else {
+                    ret.backend = "OpenCL";
+                    return Ok(ret);
+                }
+            }
+        }
+
+        // wgpu path
+        if !matches!(self.initialized_backend, BackendType::Cpu(_))
+            && wgpu::is_buffer_supported(buffers)
+        {
+            if self.share_wgpu_instances {
+                let hash = self.get_current_checksum(buffers);
+                let has_any_cache = CACHED_WGPU.with(|x| !x.0.borrow().is_empty());
+                if has_any_cache {
+                    return CACHED_WGPU.with(|x| {
+                        let mut cached = x.0.borrow_mut();
+                        if let Some(wgpu) = cached.get(&hash) {
+                            wgpu.undistort_image(buffers, &itm, drawing_buffer);
+                            ret.backend = "wgpu";
+                            Ok(ret)
+                        } else {
+                            Err(GyroflowCoreError::NoCachedWgpuInstance(
+                                self.get_current_key(buffers),
+                            ))
+                        }
+                    });
+                } else {
+                    log::error!(
+                        "No cached wgpu found for key: {}",
+                        self.get_current_key(buffers)
+                    );
+                }
+            } else if let Some(ref wgpu) = self.wgpu {
+                wgpu.undistort_image(buffers, &itm, drawing_buffer);
+                ret.backend = "wgpu";
+                return Ok(ret);
+            } else {
+                //log::error!("No wgpu instance!");
+            }
+        }
+
+        // ---------- DEBUG: hashes right before CPU ----------
+        #[cfg(debug_assertions)]
+        let (in_hash_before, out_hash_before) = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            fn hash_buf(buf: &[u8]) -> u64 {
+                let mut hasher = DefaultHasher::new();
+                buf.hash(&mut hasher);
+                hasher.finish()
+            }
+
+            let in_hash = match &buffers.input.data {
+                gpu::BufferSource::Cpu { buffer } => hash_buf(buffer),
+                _ => 0,
+            };
+            let out_hash = match &buffers.output.data {
+                gpu::BufferSource::Cpu { buffer } => hash_buf(buffer),
+                _ => 0,
+            };
+            log::info!(
+                "process_pixels: BEFORE CPU: in_hash={}, out_hash={}",
+                in_hash,
+                out_hash
+            );
+            (in_hash, out_hash)
+        };
+        // ---------------------------------------------------------------------------
+
+        // CPU path
+        let ok = match self.interpolation {
+            Interpolation::Bilinear => {
+                Self::undistort_image_cpu::<2, T>(
+                    buffers,
+                    &itm.kernel_params,
+                    &self.compute_params.distortion_model,
+                    self.compute_params.digital_lens.as_ref(),
+                    &itm.matrices,
+                    drawing_buffer,
+                    &itm.mesh_data,
+                )
+            }
+            Interpolation::Bicubic => {
+                Self::undistort_image_cpu::<4, T>(
+                    buffers,
+                    &itm.kernel_params,
+                    &self.compute_params.distortion_model,
+                    self.compute_params.digital_lens.as_ref(),
+                    &itm.matrices,
+                    drawing_buffer,
+                    &itm.mesh_data,
+                )
+            }
+            Interpolation::Lanczos4 => {
+                Self::undistort_image_cpu::<8, T>(
+                    buffers,
+                    &itm.kernel_params,
+                    &self.compute_params.distortion_model,
+                    self.compute_params.digital_lens.as_ref(),
+                    &itm.matrices,
+                    drawing_buffer,
+                    &itm.mesh_data,
+                )
+            }
+            Interpolation::RobidouxSharp => {
+                Self::undistort_image_cpu::<10, T>(
+                    buffers,
+                    &itm.kernel_params,
+                    &self.compute_params.distortion_model,
+                    self.compute_params.digital_lens.as_ref(),
+                    &itm.matrices,
+                    drawing_buffer,
+                    &itm.mesh_data,
+                )
+            }
+            Interpolation::Robidoux => {
+                Self::undistort_image_cpu::<11, T>(
+                    buffers,
+                    &itm.kernel_params,
+                    &self.compute_params.distortion_model,
+                    self.compute_params.digital_lens.as_ref(),
+                    &itm.matrices,
+                    drawing_buffer,
+                    &itm.mesh_data,
+                )
+            }
+            Interpolation::Mitchell => {
+                Self::undistort_image_cpu::<12, T>(
+                    buffers,
+                    &itm.kernel_params,
+                    &self.compute_params.distortion_model,
+                    self.compute_params.digital_lens.as_ref(),
+                    &itm.matrices,
+                    drawing_buffer,
+                    &itm.mesh_data,
+                )
+            }
+            Interpolation::CatmullRom => {
+                Self::undistort_image_cpu::<13, T>(
+                    buffers,
+                    &itm.kernel_params,
+                    &self.compute_params.distortion_model,
+                    self.compute_params.digital_lens.as_ref(),
+                    &itm.matrices,
+                    drawing_buffer,
+                    &itm.mesh_data,
+                )
+            }
+        };
+
+        // ---------- DEBUG: hashes after CPU ----------
+        #[cfg(debug_assertions)]
+        {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            fn hash_buf(buf: &[u8]) -> u64 {
+                let mut hasher = DefaultHasher::new();
+                buf.hash(&mut hasher);
+                hasher.finish()
+            }
+
+            let in_hash_after = match &buffers.input.data {
+                gpu::BufferSource::Cpu { buffer } => hash_buf(buffer),
+                _ => 0,
+            };
+            let out_hash_after = match &buffers.output.data {
+                gpu::BufferSource::Cpu { buffer } => hash_buf(buffer),
+                _ => 0,
+            };
+           /*  log::info!(
+                "process_pixels: AFTER CPU:  in_hash={}, out_hash={}",
+                in_hash_after,
+                out_hash_after
+            );*/
+        }
+        // ---------------------------------------------------------------------------
+
+        if ok {
+            ret.backend = "CPU";
+            return Ok(ret);
+        }
+    } else {
+        log::warn!("No stab data at {timestamp_us}");
+        return Err(GyroflowCoreError::NoStabilizationData(timestamp_us));
     }
+    Err(GyroflowCoreError::Unknown)
+}
+
+
+
 }
 
 unsafe impl Send for Stabilization { }
 unsafe impl Sync for Stabilization { }
+
+
+fn hash_buf(buf: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    buf.hash(&mut h);
+    h.finish()
+}

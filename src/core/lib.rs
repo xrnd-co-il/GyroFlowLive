@@ -25,6 +25,8 @@ pub mod gpu;
 pub mod util;
 pub mod stabilization_params;
 
+pub mod stmap_live;
+
 use std::sync::{ Arc, atomic::{ AtomicU64, AtomicBool, Ordering::SeqCst } };
 use std::collections::BTreeMap;
 use keyframes::*;
@@ -165,6 +167,17 @@ impl StabilizationManager {
         if duration_ms < 10000.0 { // If the video is shorter than 10s, use Complementary
             let mut gyro_source = self.gyro.write();
             gyro_source.integration_method = 1; // Complementary
+        }
+
+        self.pose_estimator.sync_results.write().clear();
+        self.keyframes.write().clear();
+    }
+
+    pub fn init_from_stream_data(&self, fps: f64, video_size: (usize, usize)) {
+        {
+            let mut params = self.params.write();
+            params.fps = fps;
+            params.size = video_size;
         }
 
         self.pose_estimator.sync_results.write().clear();
@@ -320,6 +333,8 @@ impl StabilizationManager {
         log::info!("Live IMU mode enabled (keep={keep_secs}s, a={a_sync}, b={b_sync}, fps={fps})");
         Ok(())
     }
+
+
 
     pub fn start_single_stream(&self, 
         metadata: FileMetadata,

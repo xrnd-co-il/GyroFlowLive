@@ -135,6 +135,7 @@ impl FrameTransform {
 
     pub fn at_timestamp(params: &ComputeParams, timestamp_ms: f64, frame: usize) -> Self {
         // ----------- Keyframes -----------
+        //we can safely ignore the keyframes in the live version.
         let video_rotation = params.keyframes.value_at_video_timestamp(&KeyframeType::VideoRotation, timestamp_ms).unwrap_or(params.video_rotation);
         let background_margin = params.keyframes.value_at_video_timestamp(&KeyframeType::BackgroundMargin, timestamp_ms).unwrap_or(params.background_margin);
         let background_feather = params.keyframes.value_at_video_timestamp(&KeyframeType::BackgroundFeather, timestamp_ms).unwrap_or(params.background_margin_feather);

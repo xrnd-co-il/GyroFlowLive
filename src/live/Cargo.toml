@@ -3,7 +3,33 @@ name = "live"
 version = "0.1.0"
 edition = "2024"
 
+[env]
+VCPKG_ROOT       = "C:\\git\\vcpkg"              # adjust to your vcpkg path
+VCPKGRS_DYNAMIC  = "1"                           # link against ffmpeg DLLs from vcpkg 
+FFMPEG_DIR         = "C:\\git\\vcpkg\\installed\\x64-windows"
+FFMPEG_INCLUDE_DIR = "C:\\git\\vcpkg\\installed\\x64-windows\\include"
+FFMPEG_LIB_DIR     = "C:\\git\\vcpkg\\installed\\x64-windows\\lib"
+
+[features]
+default = ["opencv"]
+opencl = ["gyroflow-core/use-opencl"]
+opencv = ["gyroflow-core/use-opencv"]
+
+
+
 [dependencies]
+ffmpeg-next = { version = "8", features = ["codec","device","filter","format","software-resampling","software-scaling"] }
 crossbeam-channel = "0.5"
 gyroflow-core = { path = "C:\\git\\GyroFlowLive\\src\\core" }
 serde_json = "1.0.145"
+anyhow = "1"
+ffmpeg-sys-next = { version = "8", default-features = false, features = [
+  "avcodec", "avdevice", "avfilter", "avformat", "swresample", "swscale"
+] }
+
+
+thiserror = "1"
+once_cell = "1.21.3"
+log = "0.4.28"
+exr = "1.73.0"
+env_logger = "0.11.8"

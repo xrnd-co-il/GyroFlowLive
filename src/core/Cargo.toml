@@ -85,6 +85,7 @@ opencv = { version = "0.95", features = ["clang-runtime"], optional = true }
 median = "0.3"
 
 wgpu = { version = "26", features = ["spirv", "naga-ir"] }
+anyhow = "1.0.100"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 metal = { version = "0.32.0" }

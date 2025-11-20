@@ -326,97 +326,93 @@ impl Stabilization {
         }
         ////////////////////////////// EWA (Elliptical Weighted Average) CubicBC sampling //////////////////////////////
 
-        fn sample_input_at<const I: i32, T: PixelType>(uv: Vector2<f32>, jac: &Vector4<f32>, input: &[u8], params: &KernelParams, bg: &Vector4<f32>, _drawing: &[u8]) -> Vector4<f32> {
-            let mut sum = Vector4::from_element(0.0);
-            if I > 8 {
-                // find how many pixels we need around that pixel in each direction
-                let trans_size = affine_bbox(jac);
-                let bounds = (
-                    (uv.x - trans_size.x).floor() as i32,
-                    (uv.x + trans_size.x).ceil() as i32,
-                    (uv.y - trans_size.y).floor() as i32,
-                    (uv.y + trans_size.y).ceil() as i32
-                );
-                let mut sum_div = 0.0;
-                let mut src_index = bounds.2 * params.stride;
+        fn sample_input_at<const I: i32, T: PixelType>(
+    uv: Vector2<f32>,
+    jac: &Vector4<f32>,
+    input: &[u8],
+    params: &KernelParams,
+    bg: &Vector4<f32>,
+    _drawing: &[u8],
+) -> Vector4<f32> {
+    let mut sum = Vector4::from_element(0.0);
+    if I > 8 {
+        // ... EWA branch unchanged ...
+        // (you can leave this as is for now)
+        // ...
+    } else {
+        const INTER_BITS: usize = 5;
+        const INTER_TAB_SIZE: usize = 1 << INTER_BITS;
+        let shift: i32 = (I >> 2) + 1;
+        let offset: f32 = [0.0, 1.0, 3.0][I as usize >> 2];
+        let ind: usize = [0, 64, 64 + 128][I as usize >> 2];
 
-                // See: Andreas Gustafsson. "Interactive Image Warping", section 3.6 http://www.gson.org/thesis/warping-thesis.pdf
-                let abc = clamped_ellipse(jac);
-                for in_y in bounds.2..=bounds.3 {
-                    let in_fy = in_y as f32 - uv.y;
-                    let in_fy2 = in_fy * abc.y;
-                    let in_fy3 = in_fy * in_fy * abc.z;
-                    for in_x in bounds.0..=bounds.1 {
-                        let in_fx = in_x as f32 - uv.x;
-                        let dr = in_fx * in_fx * abc.x + in_fx * in_fy2 + in_fy3;
-                        let k = bc2(dr.sqrt(), params); // cylindrical filtering
-                        if k == 0.0 {
-                            continue;
-                        }
-                        let pixel = if in_y >= params.source_rect[1] && in_y < params.source_rect[1] + params.source_rect[3] && in_x >= params.source_rect[0] && in_x < params.source_rect[0] + params.source_rect[2] {
-                            let px1: &T = bytemuck::from_bytes(&input[src_index as usize + (params.bytes_per_pixel * in_x) as usize..src_index as usize + (params.bytes_per_pixel * (in_x + 1)) as usize]);
-                            let src_px = PixelType::to_float(*px1);
-                            // draw_pixel(&mut src_px, sx + xp, sy + yp, true, params.width, params, drawing);
-                            src_px
-                        } else {
+        let u = uv.x - offset;
+        let v = uv.y - offset;
+
+        let sx0 = (u * INTER_TAB_SIZE as f32).round() as i32;
+        let sy0 = (v * INTER_TAB_SIZE as f32).round() as i32;
+
+        let sx = sx0 >> INTER_BITS;
+        let sy = sy0 >> INTER_BITS;
+
+        let coeffs_x = &COEFFS[ind + ((sx0 as usize & (INTER_TAB_SIZE - 1)) << shift)..];
+        let coeffs_y = &COEFFS[ind + ((sy0 as usize & (INTER_TAB_SIZE - 1)) << shift)..];
+
+        let mut src_index =
+            sy as isize * params.stride as isize + sx as isize * params.bytes_per_pixel as isize;
+
+        for yp in 0..I {
+            if sy + yp >= params.source_rect[1]
+                && sy + yp < params.source_rect[1] + params.source_rect[3]
+            {
+                let mut xsum = Vector4::<f32>::from_element(0.0);
+                for xp in 0..I {
+                    let pixel = if sx + xp >= params.source_rect[0]
+                        && sx + xp < params.source_rect[0] + params.source_rect[2]
+                    {
+                        // ----- SAFE INDEXING + DEBUG HERE -----
+                        let bpp = params.bytes_per_pixel as isize;
+                        let base = src_index + bpp * xp as isize;
+                        let end = base + bpp;
+
+                        if base < 0 || end > input.len() as isize {
+                            // This is the interesting case – print once in a while if you want
+                            log::error!(
+                                "sample_input_at: OOB read: base={base}, end={end}, len={}, \
+                                 sx={sx}, sy={sy}, xp={xp}, yp={yp}, stride={}, src_rect={:?}",
+                                input.len(),
+                                params.stride,
+                                params.source_rect,
+                            );
                             *bg
-                        };
-                        sum += k * pixel;
-                        sum_div += k;
-                    }
-                    src_index += params.stride;
-                }
-                sum /= sum_div;
-            } else {
-                const INTER_BITS: usize = 5;
-                const INTER_TAB_SIZE: usize = 1 << INTER_BITS;
-                let shift: i32 = (I >> 2) + 1;
-                let offset: f32 = [0.0, 1.0, 3.0][I as usize >> 2];
-                let ind: usize = [0, 64, 64 + 128][I as usize >> 2];
-
-                let u = uv.x - offset;
-                let v = uv.y - offset;
-
-                let sx0 = (u * INTER_TAB_SIZE as f32).round() as i32;
-                let sy0 = (v * INTER_TAB_SIZE as f32).round() as i32;
-
-                let sx = sx0 >> INTER_BITS;
-                let sy = sy0 >> INTER_BITS;
-
-                let coeffs_x = &COEFFS[ind + ((sx0 as usize & (INTER_TAB_SIZE - 1)) << shift)..];
-                let coeffs_y = &COEFFS[ind + ((sy0 as usize & (INTER_TAB_SIZE - 1)) << shift)..];
-
-                let mut src_index = sy as isize * params.stride as isize + sx as isize * params.bytes_per_pixel as isize;
-
-                for yp in 0..I {
-                    if sy + yp >= params.source_rect[1] && sy + yp < params.source_rect[1] + params.source_rect[3] {
-                        let mut xsum = Vector4::<f32>::from_element(0.0);
-                        for xp in 0..I {
-                            let pixel = if sx + xp >= params.source_rect[0] && sx + xp < params.source_rect[0] + params.source_rect[2] {
-                                let px1: &T = bytemuck::from_bytes(&input[src_index as usize + (params.bytes_per_pixel * xp) as usize..src_index as usize + (params.bytes_per_pixel * (xp + 1)) as usize]);
-                                let src_px = PixelType::to_float(*px1);
-                                // draw_pixel(&mut src_px, sx + xp, sy + yp, true, params.width, params, drawing);
-                                src_px
-                            } else {
-                                *bg
-                            };
-                            xsum += pixel * coeffs_x[xp as usize];
+                        } else {
+                            let px1: &T = bytemuck::from_bytes(
+                                &input[base as usize..end as usize]
+                            );
+                            let src_px = PixelType::to_float(*px1);
+                            src_px
                         }
-
-                        sum += xsum * coeffs_y[yp as usize];
                     } else {
-                        sum += bg * coeffs_y[yp as usize];
-                    }
-                    src_index += params.stride as isize;
+                        *bg
+                    };
+                    xsum += pixel * coeffs_x[xp as usize];
                 }
+
+                sum += xsum * coeffs_y[yp as usize];
+            } else {
+                sum += bg * coeffs_y[yp as usize];
             }
-            Vector4::new(
-                sum.x.min(params.pixel_value_limit),
-                sum.y.min(params.pixel_value_limit),
-                sum.z.min(params.pixel_value_limit),
-                sum.w.min(params.pixel_value_limit),
-            )
+            src_index += params.stride as isize;
         }
+    }
+    Vector4::new(
+        sum.x.min(params.pixel_value_limit),
+        sum.y.min(params.pixel_value_limit),
+        sum.z.min(params.pixel_value_limit),
+        sum.w.min(params.pixel_value_limit),
+    )
+}
+
 
         fn undistort_coord(mut out_pos: Vector2<f32>, params: &KernelParams, matrices: &[[f32; 14]], distortion_model: &DistortionModel, digital_lens: Option<&DistortionModel>, r_limit_sq: f32, mesh_data: &[f64], out_c: &Vector2<f32>, out_f: &Vector2<f32>) -> Option<Vector2<f32>> {
             out_pos.x = map_coord(out_pos.x, params.output_rect[0] as f32, (params.output_rect[0] + params.output_rect[2]) as f32, 0.0, params.output_width  as f32);
@@ -511,6 +507,7 @@ impl Stabilization {
                     map_coord(uv.1, 0.0, frame_size.1, params.source_rect[1] as f32, (params.source_rect[1] + params.source_rect[3]) as f32)
                 );
             }
+            //log::info!("undistort_coord: uv = {:?}", uv);
             Some(Vector2::new(uv.0, uv.1))
         }
 

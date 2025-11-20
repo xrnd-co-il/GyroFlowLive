@@ -1,3 +1,9 @@
+
+mod render_live;
+mod live_pix_fmt;
+mod fplay;
+mod render_map_kind;
+
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,14 +21,31 @@ use gyroflow_core::gyro_source::FileMetadata;
 use gyroflow_core::gyro_source::live::LiveImuSample;
 use gyroflow_core::stabilization_params::ReadoutDirection;
 use gyroflow_core::StabilizationManager;
+use gyroflow_core::stmap_live::{StmapsLive, LiveFrameJob};
+
+use crate::render_live::{LiveRenderConfig, render_live_loop};
+use crate::live_pix_fmt::{LiveFrame, LivePixFmt, spawn_stream_reader};
+
 
 const IMU_ADDR: &str = "127.0.0.1:7007";
 // const FRAME_ADDR: &str = "127.0.0.1:7008"; // unused for now
 
+const MAX_QUEUE_WARN: usize = 50;
+const URL: &str = "C:\\git\\videoToTest.mp4"; // replace with your stream URL
+
+const FPS: f64 = 50.0;
+const WIDTH: usize = 1280;
+const HEIGHT: usize = 720;
+
+
 fn main() {
+
+    env_logger::init();
     // Manager + metadata
     let stab_man = Arc::new(StabilizationManager::default());
     let metadata: FileMetadata = FileMetadata::default();
+
+    stab_man.init_from_stream_data(FPS, (WIDTH, HEIGHT));
 
     // Initialize live ring (3s retention; scale placeholders a=1./0, b=0.0)
     let _ = stab_man.start_single_stream(metadata, 3.0, 1.0, 0.0);
@@ -33,11 +56,27 @@ fn main() {
 
     // Crossbeam channel (Sender, Receiver)
     let (imu_tx, imu_rx) = unbounded::<LiveImuSample>();
+    let (frame_tx, frame_rx) = unbounded::<(usize, LiveFrame)>();
+    //create an stmap
+    //let st_live: Arc<StmapsLive> = Arc::new(StmapsLive::new(Arc::clone(&stab_man)));
+
+    let stream_reader_thread =  spawn_stream_reader(URL, frame_tx.clone(), LivePixFmt::Rgb24, MAX_QUEUE_WARN, /*Arc::clone(&st_live)*/)
+        .expect("failed to spawn stream reader thread");
+
+    let cfg = LiveRenderConfig::default();
+
+    let value = Arc::clone(&stab_man);
+    let render_thread = thread::spawn(move || {
+        println!("Starting render live loop");
+        render_live_loop(frame_rx, Arc::clone(&value), cfg);
+    });
+    
 
     // Spawn server thread (binds and waits for generator to connect and write)
     spawn_line_server::<LiveImuSample>("imu server", IMU_ADDR, imu_tx, Arc::clone(&stop), parse_imu_line);
 
     // Spawn consumer thread: pull samples from channel and push into GyroSource
+
     {
         let stab = Arc::clone(&stab_man);
         thread::spawn(move || {

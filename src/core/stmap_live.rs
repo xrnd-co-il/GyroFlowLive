@@ -3,12 +3,14 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, SendError, Sender, TrySendError, unbounded};
 use log::{debug, error, info, warn};
-
+use exr::prelude::{SpecificChannels, Vec2, Image, Compression, WritableImage};
 use crate::{StabilizationManager, stabilization::*, zooming::*};
+use rayon::prelude::ParallelSliceMut;
+use rayon::iter::ParallelIterator;
+use rayon::iter::IndexedParallelIterator;
 // reuse your existing helpers & types from stmaps.rs
-use crate::stmap::{parallel_exr}; // if it's in stmaps.rs; adjust path
 
 /// Item submitted by the capture/render scheduler.
 #[derive(Clone, Copy, Debug)]
@@ -31,13 +33,14 @@ impl StmapsLive {
     /// Create a live STMaps worker with bounded queues.
     /// - in_cap: how many pending frame jobs we queue
     /// - out_cap: how many finished stmaps we keep for the render thread
-    pub fn new(stab: Arc<StabilizationManager>, in_cap: usize, out_cap: usize) -> Self {
-        let (tx_in, rx_in) = bounded::<LiveFrameJob>(in_cap.max(1));
-        let (tx_out, rx_out) = bounded::<StmapItem>(out_cap.max(1));
+    pub fn new(stab: Arc<StabilizationManager>) -> Self {
+        let (tx_in, rx_in) = unbounded::<LiveFrameJob>();
+        let (tx_out, rx_out) = unbounded::<StmapItem>();
         let running = Arc::new(AtomicBool::new(true));
 
         let running_flag = running.clone();
 
+        println!("Starting stmaps_live worker...");
         let worker = thread::Builder::new()
             .name("stmaps_live_worker".into())
             .spawn(move || {
@@ -45,23 +48,28 @@ impl StmapsLive {
             })
             .expect("spawn stmaps live worker");
 
+
         Self { tx_in, rx_out, running, _worker: worker }
     }
 
+     pub fn rx(&self) -> Receiver<StmapItem> {
+        self.rx_out.clone()
+    }
+
+
+
     /// Non-blocking: submit a frame job.
     /// If the queue is full, drop the **oldest** job to keep latency bounded.
-    pub fn submit_frame(&self, job: LiveFrameJob) {
-        match self.tx_in.try_send(job) {
+    pub fn submit_frame(&self, frame_index: usize, ts_us: i64) {
+        let job = LiveFrameJob {
+            frame_index,
+            frame_ts_ms: ts_us as f64 / 1000.0,
+        };
+        match self.tx_in.send(job) {
             Ok(_) => {}
-            Err(TrySendError::Full(j)) => {
-                // Drop oldest by draining one then re-send latest
-                warn!("stmaps_live: input queue full; dropping oldest");
-                let _ = self.tx_in.recv(); // remove one (oldest)
-                let _ = self.tx_in.try_send(j);
-            }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(SendError(_)) => {
                 error!("stmaps_live: input channel disconnected");
-            }
+            } 
         }
     }
 
@@ -83,6 +91,7 @@ impl StmapsLive {
         tx_out: Sender<StmapItem>,
         running: Arc<AtomicBool>,
     ) {
+        println!("Starting stmaps_live worker loop...");
         // --------- GLOBAL CACHE (recomputed on param/lens changes) ---------
         // filename_base mirrors generate_stmaps()
         let filename_base = {
@@ -109,10 +118,12 @@ impl StmapsLive {
 
         while running.load(Ordering::Relaxed) {
             let job = match rx_in.recv_timeout(Duration::from_millis(10)) {
-                Ok(j) => j,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
+                Ok(j) => {println!("got live frameJob."); j},
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {print!("couldnt get live frameJob.") ;continue},
+                Err(_) => {print!("couldnt get live frameJob."); break},
             };
+
+            
 
             // ComputeParams fresh per job, similar to generate_stmaps()
             let mut compute_params = ComputeParams::from_manager(&stab);
@@ -142,24 +153,19 @@ impl StmapsLive {
                 job.frame_ts_ms,
             ) {
                 Ok(item) => {
-                    // keep out queue bounded: drop oldest if full
-                    if let Err(TrySendError::Full(_)) = tx_out.try_send(item) {
-                        warn!("stmaps_live: output queue full; dropping oldest result");
-                        let _ = tx_out.recv();
-                        let _ = tx_out.try_send(
-                            // we must rebuild or keep a copy; we have the item in scope above, so:
-                            Self::build_maps_for_frame_live(
-                                &stab, ComputeParams::from_manager(&stab), kernel_flags,
-                                &filename_base, job.frame_index, job.frame_ts_ms
-                            ).unwrap_or_else(|_| (String::new(), job.frame_index, vec![], vec![]))
-                        );
+                    match tx_out.send(item){
+                        //debugging purpose
+                        Ok(_) => {println!("stmaps_live: sent stmap for frame {}", job.frame_index);},
+                        Err(SendError(_)) => {
+                            error!("stmaps_live: output channel disconnected");
+                        }
                     }
                 }
                 Err(e) => {
                     warn!("stmaps_live: failed to build maps for frame {} ts={:.3}ms: {e:?}",
                           job.frame_index, job.frame_ts_ms);
                     // You may still send a placeholder so the renderer does not stall:
-                    let _ = tx_out.try_send((filename_base.clone(), job.frame_index, vec![], vec![]));
+                    let _ = tx_out.send((filename_base.clone(), job.frame_index, vec![], vec![]));
                 }
             }
         }
@@ -241,7 +247,7 @@ impl StmapsLive {
 
         // undist
         let mesh_data2 = transform.mesh_data.iter().map(|x| *x as f64).collect::<Vec<f64>>();
-        let undist = parallel_exr(new_width, new_height, |x, y| {
+        let undist = Self::parallel_exr(new_width, new_height, |x, y| {
             let mut sy = if compute_params.frame_readout_direction.is_horizontal() {
                 (x.round() as i32).min(transform.kernel_params.width).max(0) as usize
             } else {
@@ -273,7 +279,7 @@ impl StmapsLive {
         compute_params.width        = width;  compute_params.height        = height;
         compute_params.output_width = width;  compute_params.output_height = height;
 
-        let dist = parallel_exr(width, height, |x, y| {
+        let dist = Self::parallel_exr(width, height, |x, y| {
             let distorted = [(x as f32, y as f32)];
             let (camera_matrix, distortion_coeffs, _p, rotations, is, mesh) =
                 FrameTransform::at_timestamp_for_points(&compute_params, &distorted, timestamp_ms, Some(frame), true);
@@ -284,5 +290,30 @@ impl StmapsLive {
         });
 
         Ok((filename_base.to_string(), frame, dist, undist))
+    }
+
+
+    fn parallel_exr(width: usize, height: usize, cb: impl Fn(f32, f32) -> Option<(f32, f32)> + Sync) -> Vec<u8> {
+        let mut coords = vec![0.0f32; width * height * 2];
+        coords.par_chunks_mut(width * 2).enumerate().for_each(|(y, row)| { // Parallel iterator over buffer rows
+            row.chunks_mut(2).enumerate().for_each(|(x, pix)| { // iterator over row pixels
+                if let Some(pt) = cb(x as f32, y as f32) {
+                    pix[0] = pt.0;
+                    pix[1] = pt.1;
+                }
+            });
+        });
+        let channels = SpecificChannels::rgb(|Vec2(x, y)| (
+                    coords[y * width * 2 + x * 2 + 0] / width as f32,
+                1.0 - (coords[y * width * 2 + x * 2 + 1] / height as f32),
+                0.0
+        ) );
+        let mut data = Vec::new();
+        let mut img = Image::from_channels((width, height), channels);
+        img.layer_data.encoding.compression = Compression::ZIP16;
+        if let Err(e) = img.write().to_buffered(std::io::Cursor::new(&mut data)) {
+            ::log::error!("Failed to write EXR: {e:?}");
+        }
+        data
     }
 }
