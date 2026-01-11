@@ -101,6 +101,17 @@ impl LensProfile {
         lens
     }
 
+    pub fn choose_for(&self, width: usize, height: usize, fps: f64) -> LensProfile {
+        self.get_all_matching_profiles()
+            .into_iter()
+            .find(|p|
+                p.calib_dimension.w == width &&
+                p.calib_dimension.h == height &&
+                (p.fps - fps).abs() < 0.01
+            )
+            .unwrap_or_else(|| self.clone())
+    }
+
     pub fn load_from_data(&mut self, data: &str) -> std::result::Result<(), crate::GyroflowCoreError> {
         *self = Self::from_json(&data)?;
 
@@ -272,6 +283,7 @@ impl LensProfile {
                 self.fisheye_params.camera_matrix[1].into(),
                 self.fisheye_params.camera_matrix[2].into()
             ]);
+            
             if !self.asymmetrical {
                 mat[(0, 2)] = self.calib_dimension.w as f64 / 2.0;
                 mat[(1, 2)] = self.calib_dimension.h as f64 / 2.0;

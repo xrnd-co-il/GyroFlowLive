@@ -157,6 +157,13 @@ impl FrameTransform {
             input_horizontal_stretch,
             input_vertical_stretch,
             focal_length) = Self::get_lens_data_at_timestamp(params, timestamp_ms, false);
+            /*println!("camera_matrix: {:?}", camera_matrix);
+            println!("distortion_coeffs: {:?}", distortion_coeffs);
+            println!("radial_distortion_limit: {:?}", radial_distortion_limit);
+            print!("input_horizontal_stretch: {:?}", input_horizontal_stretch);
+            println!("input_vertical_stretch: {:?}", input_vertical_stretch);
+            println!("focal_length: {:?}", focal_length);*/
+
         // ----------- Lens -----------
 
         let mut fov = Self::get_fov(params, frame, true, timestamp_ms, false);
@@ -205,6 +212,8 @@ impl FrameTransform {
 
         let quat1 = gyro.org_quat_at_timestamp(timestamp_ms).inverse();
         let smoothed_quat1 = gyro.smoothed_quat_at_timestamp(timestamp_ms);
+        
+        
 
         // Only compute 1 matrix if not using rolling shutter correction
         let rows = if frame_readout_time.abs() > 0.0 { if params.frame_readout_direction.is_horizontal() { params.width } else { params.height } } else { 1 };
@@ -215,9 +224,31 @@ impl FrameTransform {
             } else {
                 start_ts
             };
+            let readout_quat = gyro.org_quat_at_timestamp(quat_time);
             let quat = smoothed_quat1
                      * quat1
-                     * gyro.org_quat_at_timestamp(quat_time);
+                     * readout_quat;
+            if y == 0 {
+
+                println!(
+                    "Frame {} | row 0 | ts {:.3}\n\
+                    > FINAL quat   = [{:.6}, {:.6}, {:.6}, {:.6}]\n\
+                    > ORG   quat   = [{:.6}, {:.6}, {:.6}, {:.6}]\n\
+                    > SMOOTH quat  = [{:.6}, {:.6}, {:.6}, {:.6}]\n\
+                    readout ts: {:.3} ms [{:.6}, {:.6}, {:.6}, {:.6}]",
+                    frame,
+                    quat_time,
+                    // FINAL quat
+                    quat.w, quat.i, quat.j, quat.k,
+                    // ORG quat
+                    quat1.w, quat1.i, quat1.j, quat1.k,
+                    // SMOOTH quat
+                    smoothed_quat1.w, smoothed_quat1.i, smoothed_quat1.j, smoothed_quat1.k,
+                    //readout quat
+                    frame_readout_time.abs(), readout_quat.w, readout_quat.i, readout_quat.j, readout_quat.k
+
+                );
+            }
 
 
             let mut r = image_rotation * *quat.to_rotation_matrix().matrix();
@@ -359,6 +390,7 @@ impl FrameTransform {
             let quat = smoothed_quat1
                      * quat1
                      * gyro.org_quat_at_timestamp(quat_time);
+            
 
             let mut r = image_rotation * *quat.to_rotation_matrix().matrix();
             r[(0, 1)] *= -1.0; r[(0, 2)] *= -1.0;

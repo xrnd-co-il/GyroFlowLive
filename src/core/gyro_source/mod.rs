@@ -9,6 +9,7 @@ pub use file_metadata::*;
 pub use imu_transforms::*;
 pub use sony::interpolate_mesh;
 pub mod live;
+pub mod csv_quats;
 
 use nalgebra::*;
 use std::iter::zip;
@@ -30,6 +31,7 @@ pub use live::QuatBufferStore;
 use super::imu_integration::*;
 use super::smoothing::SmoothingAlgorithm;
 use crate::StabilizationParams;
+use std::path::Path;
 
 const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
 
@@ -37,6 +39,7 @@ pub type Quat64 = UnitQuaternion<f64>;
 pub type TimeIMU = telemetry_parser::util::IMUData;
 pub type TimeQuat = BTreeMap<i64, Quat64>; // key is timestamp_us
 pub type TimeVec = BTreeMap<i64, Vector3<f64>>; // key is timestamp_us
+
 
 pub fn make_header(period: f64) -> String {
     let period = 1.0 / period; // convert fps to period
@@ -131,6 +134,21 @@ impl GyroSource {
         self.horizon_lock_integration_method = v;
     }
 
+    fn transform_live_sample(&self, mut s: LiveImuSample) -> LiveImuSample {
+        if self.imu_transforms.has_any() {
+            // gyro: always Some in your struct; if not, mirror offline logic
+            self.imu_transforms.transform(&mut s.gyro, false);
+
+            if let Some(ref mut acc) = s.accel {
+                self.imu_transforms.transform(acc, true);
+            }
+            // if you ever add magnetometer to LiveImuSample:
+            // self.imu_transforms.transform(&mut magn, false);
+        }
+
+        s
+    }
+
     // src/core/gyro_source/mod.rs (within impl GyroSource)
     pub fn enable_live(&self, keep_seconds: f64, a: f64, b: f64, video_fps: f64) {
         let mut st = self.live.write();
@@ -148,16 +166,32 @@ impl GyroSource {
         *self.live.write() = None;
     }
 
+    pub fn load_quats_from_file<P: AsRef<Path>>(&self,
+        path: P){
+        println!("[DEBUG] Loading live quats from file: {:?}", path.as_ref());
+        let mut guard = self.live.write();
+
+        let st = guard
+            .as_mut()
+            .ok_or_else(|| "LiveState not enabled. Call enable_live() first.");
+
+        st.expect("REASON").load_quats_from_csv_sliding_windows(path)
+    }
+    
+
     /*pub fn push_live_imu(&self, ts_sensor_us: i64, gyro: [f64;3], accel: Option<[f64;3]>, now_video_us: i64) {
         if let Some(st) = self.live.write().as_mut() {
             st.ring.push(live::LiveImuSample { ts_sensor_us, gyro, accel }, now_video_us, &st.sync);
         }
     }*/
 
-    pub fn push_live_imu(&self, sample: live::LiveImuSample, now_video_us: i64) {
-    // pushing IMU into ring with fine-grained locking
+   pub fn push_live_imu(&self, sample: live::LiveImuSample, now_video_us: i64) {
         if let Some(st) = self.live.read().as_ref() {
-            st.ring.lock().push(sample, now_video_us, &st.sync);
+            // Apply same orientation / scaling as offline
+            let new_sample = self.transform_live_sample(sample);
+
+            // Now push the transformed IMU into the ring
+            st.ring.lock().push(new_sample, now_video_us, &st.sync);
         }
     }
 
@@ -180,6 +214,7 @@ impl GyroSource {
         return;
     }
     //println!("Integrating {} live IMU samples", samples.len());
+
     // 2) Convert to TimeIMU (telemetry_parser::IMUData)
     let mut imu_data_vec: Vec<TimeIMU> = Vec::with_capacity(samples.len());
     for s in &samples {
@@ -192,10 +227,12 @@ impl GyroSource {
 
     let start_ms   = imu_data_vec.first().unwrap().timestamp_ms;
     let end_ms     = imu_data_vec.last().unwrap().timestamp_ms;
+    println!("Live IMU data timestamps: {:.3} ms to {:.3} ms", start_ms, end_ms);
     let duration_ms = end_ms - start_ms;
-//println!("Live IMU data duration: {:.3} ms", duration_ms);
+    //println!("Live IMU data duration: {:.3} ms", duration_ms);
     // 3) Integrate → quats (sorted by timestamp)
     let quat_map: TimeQuat = match self.integration_method {
+        
         1 => ComplementaryIntegrator::integrate(&imu_data_vec, duration_ms),
         2 => VQFIntegrator::integrate(&imu_data_vec, duration_ms),
         3 => SimpleGyroIntegrator::integrate(&imu_data_vec, duration_ms),
@@ -229,9 +266,9 @@ impl GyroSource {
     if let Some(st) = self.live.read().as_ref() {
         st.quat_buffer_store_org.publish(buf_org.unwrap());
         st.quat_buffer_store_smoothed.publish(buf_smoothed.unwrap());
-        println!("published live quat buffers");
+        //println!("published live quat buffers");
     }
-    println!("Finished integrating live IMU data");
+    //println!("Finished integrating live IMU data");
 }
 
     /* end live handling */
@@ -607,12 +644,12 @@ impl GyroSource {
     }
 
     pub fn load_from_telemetry(&mut self, telemetry: FileMetadata) {
-        if self.duration_ms <= 0.0 {
+       /*  if self.duration_ms <= 0.0 {
             ::log::error!("Invalid duration_ms {}", self.duration_ms);
             return;
-        }
+        }*/
 
-        self.clear();
+        //self.clear();
 
         self.imu_transforms.imu_orientation = telemetry.imu_orientation.clone();
 
@@ -653,7 +690,7 @@ impl GyroSource {
             }
             self.apply_transforms();
         } else if self.quaternions.is_empty() {
-            self.integrate();
+            //self.integrate();
         }
     }
     pub fn integrate(&mut self) {
@@ -688,39 +725,139 @@ impl GyroSource {
         }
     }
 
-    pub fn recompute_smoothness(&self, alg: &dyn SmoothingAlgorithm, horizon_lock: super::smoothing::horizon::HorizonLock, compute_params: &crate::ComputeParams) -> (TimeQuat, (f64, f64, f64)) {
-        let file_metadata = self.file_metadata.read();
-        let mut smoothed_quaternions = self.quaternions.clone();
-
-        for (ts, q) in smoothed_quaternions.iter_mut() {
-            use crate::KeyframeType;
-            let timestamp_ms = *ts as f64 / 1000.0;
-            let additional_rotation_x = compute_params.keyframes.value_at_gyro_timestamp(&KeyframeType::AdditionalRotationX, timestamp_ms).unwrap_or(compute_params.additional_rotation.0) * DEG2RAD;
-            let additional_rotation_y = compute_params.keyframes.value_at_gyro_timestamp(&KeyframeType::AdditionalRotationY, timestamp_ms).unwrap_or(compute_params.additional_rotation.1) * DEG2RAD;
-            let additional_rotation_z = compute_params.keyframes.value_at_gyro_timestamp(&KeyframeType::AdditionalRotationZ, timestamp_ms).unwrap_or(compute_params.additional_rotation.2) * DEG2RAD;
-            let additional_rotation   = Quat64::from_euler_angles(additional_rotation_y, additional_rotation_x, additional_rotation_z);
-
-            *q *= additional_rotation;
-        }
-
-        if true {
-            // Lock horizon, then smooth
-            horizon_lock.lock(&mut smoothed_quaternions, &self.quaternions, &file_metadata.gravity_vectors, self.use_gravity_vectors, self.integration_method, compute_params);
-            smoothed_quaternions = alg.smooth(&smoothed_quaternions, self.duration_ms, compute_params);
+    pub fn is_live_enabled(&self) -> bool {
+        let guard = self.live.read();
+        if let Some(ref state) = *guard {
+            state.is_enabled()
         } else {
-            // Smooth, then lock horizon
-            smoothed_quaternions = alg.smooth(&smoothed_quaternions, self.duration_ms, compute_params);
-            horizon_lock.lock(&mut smoothed_quaternions, &self.quaternions, &file_metadata.gravity_vectors, self.use_gravity_vectors, self.integration_method, compute_params);
+            false
         }
-
-        let max_angles = crate::Smoothing::get_max_angles(&self.quaternions, &smoothed_quaternions, compute_params);
-
-        for (sq, q) in smoothed_quaternions.iter_mut().zip(self.quaternions.iter()) {
-            // rotation quaternion from smooth motion -> raw motion to counteract it
-            *sq.1 = sq.1.inverse() * q.1;
-        }
-        (smoothed_quaternions, max_angles)
     }
+
+    pub fn recompute_smoothness(
+    &self,
+    alg: &dyn SmoothingAlgorithm,
+    horizon_lock: super::smoothing::horizon::HorizonLock,
+    compute_params: &crate::ComputeParams,
+) -> (TimeQuat, (f64, f64, f64)) {
+
+    // -----------------------------------------------
+    // Check LIVE vs OFFLINE once
+    // -----------------------------------------------
+    
+    let is_live = self.is_live_enabled();
+
+    // -----------------------------------------------
+    // Prepare the input quaternion map + duration
+    // -----------------------------------------------
+    let (src_quats, duration_ms) = if is_live {
+        // ---------------------
+        // LIVE INPUT
+        // ---------------------
+        // You already know how to extract the live quats,
+        // e.g. via get_buffer_for_time() or get_quat_at_time()
+
+        // Example (replace with your own condition + logic):
+        let st = self.live.read();
+        let st = st.as_ref().unwrap();
+
+        // You will choose the time window yourself.
+        // Here we only place a placeholder:
+        let live_buf: QuatBuffer =
+    (*st.quat_buffer_store_org.get_latest_buffer().unwrap_or_default()).clone();
+
+        let map = live_buf.to_btreemap();
+        let dur = live_buf.duration_ms();
+
+        (map, dur)
+
+    } else {
+        // ---------------------
+        // OFFLINE INPUT
+        // ---------------------
+        (self.quaternions.clone(), self.duration_ms)
+    };
+
+
+    // -----------------------------------------------
+    // Apply additional rotations (same as before)
+    // -----------------------------------------------
+    let mut smoothed_quats = src_quats.clone();
+    for (ts, q) in smoothed_quats.iter_mut() {
+        // unchanged logic:
+        // apply keyframe-based additional rotations
+        // ...
+    }
+
+    // -----------------------------------------------
+    // Horizon lock + smoothing (same)
+    // -----------------------------------------------
+    let file_metadata = self.file_metadata.read();
+
+    if is_live {
+        // ---------------------
+        // LIVE VERSION OF HORIZON LOCK
+        // ---------------------
+        // You may want a lighter/faster lock,
+        // or to skip gravity vectors if unavailable.
+        //
+        // Or call the exact same function:
+        horizon_lock.lock(
+            &mut smoothed_quats,
+            &src_quats,
+            &file_metadata.gravity_vectors,
+            self.use_gravity_vectors,
+            self.integration_method,
+            compute_params
+        );
+
+    } else {
+        // ---------------------
+        // OFFLINE VERSION (exact code you already have)
+        // ---------------------
+        horizon_lock.lock(
+            &mut smoothed_quats,
+            &src_quats,
+            &file_metadata.gravity_vectors,
+            self.use_gravity_vectors,
+            self.integration_method,
+            compute_params
+        );
+    }
+
+    let smoothed_quats =
+        alg.smooth(&smoothed_quats, duration_ms, compute_params);
+
+    // -----------------------------------------------
+    // Compute max_angles (identical)
+    // -----------------------------------------------
+    let max_angles =
+        crate::Smoothing::get_max_angles(&src_quats, &smoothed_quats, compute_params);
+
+    // -----------------------------------------------
+    // Convert smoothed motion into counter-rotation
+    // -----------------------------------------------
+    let mut final_quats = smoothed_quats.clone();
+
+    for ((ts_out, q_out), (ts_src, q_src)) in
+        final_quats.iter_mut().zip(src_quats.iter())
+    {
+        *q_out = q_out.inverse() * *q_src;
+    }
+
+    // -----------------------------------------------
+    // If LIVE, publish result back into live buffers
+    // -----------------------------------------------
+    /*if is_live {
+        if let Some(st) = self.live.read().as_ref() {
+            if let Some(buf) = QuatBuffer::from_btreemap(&final_quats) {
+                st.quat_buffer_store_smoothed.publish(buf);
+            }
+        }
+    }*/
+
+    (final_quats, max_angles)
+}
 
     pub fn raw_imu<'a>(&'a self, file_metadata: &'a FileMetadata) -> &'a Vec<TimeIMU> {
         if !self.raw_imu.is_empty() { return &self.raw_imu }

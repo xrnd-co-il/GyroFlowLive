@@ -184,7 +184,7 @@ impl Stabilization {
                 if (params.flags & 128) == 128 { uv.1 = params.height as f32 - uv.1; } // framebuffer inverted
             }
 
-            // FocalPlaneDistortion
+            // char3_sat
             if !mesh_data.is_empty() && mesh_data[0] > 0.0 && mesh_data[mesh_data[0] as usize] > 0.0 {
                 let o = mesh_data[0] as usize; // offset to focal plane distortion data
 

@@ -34,7 +34,10 @@ impl Clone for LensProfileDatabase {
 impl LensProfileDatabase {
     pub fn get_path() -> PathBuf {
         // return std::fs::canonicalize("D:/lens_review/").unwrap_or_default();
-
+        let path = PathBuf::from("C:\\git\\GyroFlowLive\\resources\\camera_presets\\profiles.cbor.gz");
+        if path.exists() {
+            return path;
+        }
         let candidates = [
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             PathBuf::from("../Resources/camera_presets/"),
@@ -69,7 +72,9 @@ impl LensProfileDatabase {
     }
 
     pub fn load_all(&mut self) {
+        
         log::info!("Lens profiles directory: {:?}", Self::get_path());
+        println!("Lens profiles directory: {:?}", Self::get_path());
 
         let _time = std::time::Instant::now();
 
@@ -203,6 +208,7 @@ impl LensProfileDatabase {
         }
 
         ::log::info!("Loaded {} lens profiles in {:.3}ms", self.map.len(), _time.elapsed().as_micros() as f64 / 1000.0);
+        println!("Loaded {} lens profiles in {:.3}ms", self.map.len(), _time.elapsed().as_micros() as f64 / 1000.0);
         self.loaded = true;
     }
 
@@ -301,11 +307,16 @@ impl LensProfileDatabase {
             .replace("a7s3",     "a7siii")
             .replace(",", " ")
             .replace(";", " ");
+        
+        //####DEBUG####
+        println!("Searching for lens profiles: '{}'", text);
+        //#############
 
         let words = text.split_ascii_whitespace().map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>();
         if words.is_empty() {
             return Vec::new();
         }
+        
 
         let mut filtered = self.list_for_ui.iter().filter(|(name, _, _, _, _, _, author)| {
             let name = name.to_ascii_lowercase();
@@ -317,6 +328,13 @@ impl LensProfileDatabase {
             }
             return true;
         }).collect::<Vec<_>>();
+
+        //Debugging
+        println!("Found {} matching lens profiles", filtered.len());
+        //print them
+        for item in &filtered {
+            println!("  - {} (by {})", item.0, item.6);
+        }
 
         filtered.sort_by(|a, b| {
             // Is preset or favorited

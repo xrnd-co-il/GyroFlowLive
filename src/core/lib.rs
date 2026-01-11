@@ -43,6 +43,8 @@ pub use stabilization::PixelType;
 pub use wgpu::TextureFormat as WgpuTextureFormat;
 use gpu::Buffers;
 use gpu::drawing::*;
+use std::path::Path;
+
 
 pub use telemetry_parser;
 
@@ -77,6 +79,9 @@ impl Default for SyncData {
         }
     }
 }
+
+
+
 
 #[derive(Clone)]
 pub struct StabilizationManager {
@@ -156,6 +161,54 @@ impl Default for StabilizationManager {
 
 
 impl StabilizationManager {
+
+/// Initialize metadata and basic parameters from a GCSV header string.
+    ///
+    /// This does *not* touch any fields that cannot safely be inferred from
+    /// the header (fps, duration, per-frame offsets, etc.).
+    ///
+    /// Call this after you receive the header over TCP (before streaming IMU
+    /// samples), then use `start_single_stream` or your own live setup.
+    /*pub fn apply_gcsv_header(&self, header: &str) -> FileMetadata {
+        let md = file_metadata_from_gcsv_header(header);
+
+        // Apply FileMetadata to GyroSource as read-only metadata
+        {
+            let mut gyro = self.gyro.write();
+            gyro.file_metadata = ReadOnlyFileMetadata::from(md.clone());
+        }
+
+        // Update params and IMU transforms from metadata we *know* how to interpret.
+        {
+            // frame_readout_time & direction
+            if let Some(frt) = md.frame_readout_time {
+                let mut params = self.params.write();
+                // your code typically uses the absolute value in params
+                params.frame_readout_time = frt.abs();
+            }
+
+            {
+                // direction is always stored in md.frame_readout_direction
+                let mut params = self.params.write();
+                params.frame_readout_direction = md.frame_readout_direction;
+            }
+
+            // imu_orientation
+            if let Some(ori) = md.imu_orientation.clone() {
+                let mut gyro = self.gyro.write();
+                gyro.imu_transforms.'י' = Some(ori);
+            }
+        }
+
+        // Any downstream recompute is up to you; for example, you might decide
+        // to call:
+        //   self.invalidate_smoothing();
+        //   self.invalidate_zooming();
+        //
+        // here if header changes imply a different geometry.
+        md
+    } */
+
     pub fn init_from_video_data(&self, duration_ms: f64, fps: f64, frame_count: usize, video_size: (usize, usize)) {
         {
             let mut params = self.params.write();
@@ -294,45 +347,6 @@ impl StabilizationManager {
         Ok(())
     }
     /* start of live handling for the stabilzation manager */
-    pub fn start_live_gyro(
-        &self,
-        keep_secs: f64,   // e.g., 3.0
-        a_sync:   f64,    // e.g., 1.0
-        b_sync:   f64,    // e.g., 0.0
-    ) -> Result<(), GyroflowCoreError> {
-        // Read current FPS from params to keep behavior consistent with file mode
-        let fps = self.params.read().fps;
-
-        {
-            // Re-init & clear so state is fresh (mirrors the file path’s housekeeping)
-            let params = self.params.read();
-            let mut gyro = self.gyro.write();
-
-            gyro.init_from_params(&params);
-            gyro.clear();
-
-            // For visibility/debugging: mark the source as "live"
-            gyro.file_url = "live".to_string();
-            gyro.file_metadata = Default::default();
-
-            // Enable the live ring buffer
-            gyro.enable_live(keep_secs, a_sync, b_sync, fps);
-        }
-
-        // Invalidate caches so downstream recomputes with the live source
-        self.invalidate_smoothing();
-        self.invalidate_zooming();
-        // self.undistortion_invalidated.store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // --- LATER: set defaults that file metadata usually provides ---
-        // self.params.write().frame_readout_direction = ReadoutDirection::TopToBottom;
-        // self.params.write().frame_readout_time = 0.0;
-        // *self.camera_id.write() = Some("live-camera-1".to_string());
-        // let mut l = self.lens.write(); *l = LensProfile::default(); // or resolve from DB
-
-        log::info!("Live IMU mode enabled (keep={keep_secs}s, a={a_sync}, b={b_sync}, fps={fps})");
-        Ok(())
-    }
 
 
 
@@ -340,15 +354,26 @@ impl StabilizationManager {
         metadata: FileMetadata,
         keep_secs: f64,   // e.g., 3.0
         a_sync:   f64,    // e.g., 1.0
-        b_sync:   f64)  -> Result<(), GyroflowCoreError> 
-        {
+        b_sync:   f64,
+        size: (usize, usize),
+        output_size: (usize, usize),
+        p: &Path,
+        load_path: bool
+    )  -> Result<(), GyroflowCoreError> {
         // Initialize the gyro source
+        println!("[DEBUG] [start_single_stream]");
         let fps = self.params.read().fps;
         {
             let mut gyro = self.gyro.write();
             gyro.clear();
             gyro.enable_live(keep_secs, a_sync, b_sync, fps); // 3s ring buffer
             gyro.file_metadata = ReadOnlyFileMetadata::from(metadata.clone());
+            gyro.load_from_telemetry(metadata.clone());
+            if(load_path){
+                println!("[DEBUG] [start_single_stream] loading quats from file: {:?}", p);
+                gyro.load_quats_from_file(p);
+            }
+            
         }
 
         //  Apply metadata to the stabilizer params
@@ -356,19 +381,50 @@ impl StabilizationManager {
         params.frame_readout_time = metadata.frame_readout_time.unwrap_or_default();
         params.frame_readout_direction = metadata.frame_readout_direction;
         params.fps = metadata.frame_rate.unwrap_or(params.fps);
+        params.size = size;
+        params.output_size = output_size;
         //no need for frame count
-        //params.frame_count = (metadata.frame_rate.unwrap_or(params.fps) * metadata.duration_ms.unwrap_or(0.0) / 1000.0) as usize;
+        params.frame_count = 0;
 
         // Apply lens and camera info
-        if let Some(lens_json) = &self.gyro.read().file_metadata.read().lens_profile {
+       /*  if let Some(lens_json) = &self.gyro.read().file_metadata.read().lens_profile {
             let mut lens = self.lens.write();
             lens.load_from_json_value(&lens_json);
             lens.resolve_interpolations(&self.lens_profile_db.read());
+        }else{*/
+            let mut db = LensProfileDatabase::default();
+            db.load_all();
+            db.prepare_list_for_ui();
+
+            let favorites = std::collections::HashSet::new();
+            let aspect_ratio = 0;          // if you don’t care for now
+            let aspect_ratio_swapped = 0;  // same
+
+            let results = db.search("GoPro HERO6 Black 4:3 Wide NO-EIS eddy", &favorites, aspect_ratio, aspect_ratio_swapped);
+            println!("Lens profile search results for 'GoPro HERO6': {}", results[0].0);
+            for (name, key, _crc, _official, _rating, _ar, _author) in &results {
+                println!("Found profile: {name} (id = {key})");
+            }
+        
+
+            // Pick the first result:
+            if let Some((_, key, _, _, _, _, _)) = results.first() {
+                if let Some(profile) = db.get_by_id(key) {
+                    self.lens.write().clone_from(profile);
+                }
+            //}
+            let profile = self.lens.read().choose_for(2704, 2028, 29.97);
+            self.lens.write().clone_from(&profile);
+            //println!("camera matrix after live load: {:?}", self.lens.read().get_camera_matrix(size, false));
+            //println!("lens: {}", self.lens.read().get_json().unwrap())
+            //self.lens.write().resolve_interpolations(&db);
+            
+
         }
 
         // Reset internal states
-        self.invalidate_smoothing();
-        self.invalidate_zooming();
+        //self.invalidate_smoothing();
+        //self.invalidate_zooming();
 
         Ok(())
     }
@@ -385,12 +441,115 @@ impl StabilizationManager {
         // self.recompute_gyro();  // only if needed
 
         // occasional (or per-N-frames) heavy recompute:
-        if frame_idx % recompute_period == 0{
+        if frame_idx % recompute_period == 30{
             self.recompute_smoothness();
             self.recompute_adaptive_zoom();
             self.recompute_undistortion();
+
         }
         
+    }
+
+    pub fn load_gyro_info_live(
+        &self,
+        mut md: gyro_source::FileMetadata,
+    ) -> Result<(), GyroflowCoreError> {
+        // Make sure any cached smoothing/zooming is recomputed with this metadata
+        self.invalidate_smoothing();
+        self.invalidate_zooming();
+        println!("step 1 live load gyro info");
+    // except we don't have a real URL or a file on disk.
+        // --- 1) Lens profile ---
+        if let Some(ref lens) = md.lens_profile {
+            let mut l = self.lens.write();
+            if let Some(lens_str) = lens.as_str() {
+                // Lens by name → resolve from lens DB
+                let mut db = self.lens_profile_db.read();
+                if !db.loaded {
+                    drop(db);
+                    {
+                        let mut db = self.lens_profile_db.write();
+                        db.load_all();
+                    }
+                    db = self.lens_profile_db.read();
+                }
+                if let Some(found) = db.find(lens_str) {
+                    *l = found.clone();
+                }
+            } else if lens.is_object() {
+                // Lens embedded as JSON object in metadata
+                l.load_from_json_value(lens);
+                // In file mode we do: l.path_to_file = filesystem::url_to_path(url);
+                // For live, we usually don't have a file path, so we skip that.
+                let db = self.lens_profile_db.read();
+                l.resolve_interpolations(&db);
+            }
+        }
+        println!("step 2 live load gyro info");
+        // --- 2) FPS override from metadata, if it doesn't match current params ---
+        if let Some(md_fps) = md.frame_rate {
+            let fps = self.params.read().fps;
+            if (md_fps - fps).abs() > 1.0 {
+                // Same behavior as file path: let metadata override the video FPS
+                self.override_video_fps(md_fps, false);
+            }
+        }
+        println!("step 3 live load gyro info");
+        // --- 3) Rolling shutter / readout direction ---
+        self.params.write().frame_readout_direction = md.frame_readout_direction;
+        // Special handling for Blackmagic sources, same as file path.
+        if md.detected_source
+            .as_ref()
+            .map(|v| v.starts_with("Blackmagic "))
+            .unwrap_or_default()
+    {
+        if let Some(rot) = md
+            .additional_data
+            .get("rotation")
+            .and_then(|x| x.as_u64())
+        {
+            if rot == 90 || rot == 270 {
+                log::info!("Using horizontal rolling shutter correction");
+                if rot == 90 {
+                    self.params.write().frame_readout_direction =
+                        ReadoutDirection::RightToLeft;
+                    md.imu_orientation = Some("xYz".into());
+                } else {
+                    self.params.write().frame_readout_direction =
+                        ReadoutDirection::LeftToRight;
+                    md.imu_orientation = Some("Xyz".into());
+                }
+            }
+            if rot == 180 {
+                self.params.write().frame_readout_direction =
+                    ReadoutDirection::BottomToTop;
+                md.imu_orientation = Some("YXz".into());
+            }
+        }
+    }
+
+            // Rolling shutter (frame readout time) from metadata
+            self.params.write().frame_readout_time = md.frame_readout_time.unwrap_or_default();
+
+        // We'll stash camera identifier on the manager, just like file path does.
+        let camera_id = md.camera_identifier.clone();
+
+        {
+            println!("step 4 live load gyro info");
+            // Finally, push the metadata into the GyroSource.
+            // Assumes `start_live_gyro` (or something equivalent) has already called
+            // `gyro.init_from_params(...)` so `duration_ms` is valid.
+            let mut gyro = self.gyro.write();
+            gyro.load_from_telemetry(md);
+            // In live mode we usually don't rely on FileLoadOptions, so we leave
+            // `gyro.file_load_options` as whatever default it already had.
+        }
+
+        if let Some(id) = camera_id {
+            *self.camera_id.write() = Some(id);
+        }
+        println!("step finito");
+        Ok(())
     }
 
     /* end of live helper functions + handling */
@@ -610,7 +769,15 @@ impl StabilizationManager {
                     let (quats, max_angles) = self.gyro.read().recompute_smoothness(smoothing.current().as_ref(), horizon_lock, &params);
                     let mut gyro = self.gyro.write();
                     gyro.max_angles = max_angles;
-                    gyro.smoothed_quaternions = quats;
+                    if(self.gyro.read().is_live_enabled()){
+                        if let Some(st) = self.gyro.read().live.read().as_ref() {
+                            st.quat_buffer_store_smoothed.publish(QuatBuffer::from_btreemap(&quats).unwrap());
+                        }
+                    }else{
+                        gyro.smoothed_quaternions = quats;
+
+                    }
+                    //gyro.smoothed_quaternions = quats;
                 }
 
                 // Zooming
@@ -638,7 +805,14 @@ impl StabilizationManager {
         let (quats, max_angles) = self.gyro.read().recompute_smoothness(smoothing.current().as_ref(), horizon_lock, &params);
         let mut gyro = self.gyro.write();
         gyro.max_angles = max_angles;
-        gyro.smoothed_quaternions = quats;
+        if self.gyro.read().is_live_enabled(){
+            if let Some(st) = self.gyro.read().live.read().as_ref() {
+                st.quat_buffer_store_smoothed.publish(QuatBuffer::from_btreemap(&quats).unwrap());
+            }
+        }else{
+            gyro.smoothed_quaternions = quats;
+        }
+        
     }
 
     pub fn recompute_undistortion(&self) {
@@ -897,6 +1071,11 @@ impl StabilizationManager {
                 }
             }
         }
+    }
+
+    pub fn print_hash_buffers(&self, buffers: &Buffers) {
+        println!("input: {}", buffers.input.get_checksum());
+        println!("output: {}", buffers.output.get_checksum());   
     }
 
     pub fn process_pixels<T: PixelType>(&self, mut timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers) -> Result<stabilization::ProcessedInfo, GyroflowCoreError> {
@@ -2038,7 +2217,7 @@ pub fn run_threaded<F>(cb: F) where F: FnOnce() + Send + 'static {
 
 use std::str::FromStr;
 
-use crate::gyro_source::ReadOnlyFileMetadata;
+use crate::gyro_source::{QuatBuffer, ReadOnlyFileMetadata};
 #[derive(Debug, Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub enum GyroflowProjectType {
     Simple,

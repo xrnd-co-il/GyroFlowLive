@@ -1,22 +1,20 @@
-
 use gyroflow_core::gpu::{BufferDescription, Buffers, BufferSource};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use log::{debug, info, warn, trace};
 use std::time::{Duration, Instant};
 use once_cell::sync::OnceCell;
 use gyroflow_core::StabilizationManager;
-use crate::live_pix_fmt::{LiveFrame, LivePixFmt};
+use crate::live_pix_fmt::{LiveFrame, PixelFormat};
 use gyroflow_core::stmap_live::StmapItem;
 use crate::fplay;
 use crate::Arc;
-use crate::render_map_kind::{render_with_maps_to_rgb24, RenderMapKind};
-use gyroflow_core::stabilization::pixel_formats::{RGB8};
+use gyroflow_core::stabilization::pixel_formats::{RGB8, RGBA8};
 
 #[derive(Clone, Copy)]
 pub struct LiveRenderConfig {
     pub wait_for_map_timeout: Duration,
     pub trim_before_idx: bool,
-    pub present_fps: u32,
+    pub present_fps: f64,
 }
 
 impl Default for LiveRenderConfig {
@@ -24,7 +22,20 @@ impl Default for LiveRenderConfig {
         Self {
             wait_for_map_timeout: Duration::from_millis(8),
             trim_before_idx: true,
-            present_fps: 30,
+            present_fps: 30.0,
+        }
+    }
+
+
+    
+}
+
+impl LiveRenderConfig {
+    pub fn new(present_fps: f64) -> Self {
+        Self {
+            wait_for_map_timeout: Duration::from_millis(8),
+            trim_before_idx: true,
+            present_fps: present_fps as f64,
         }
     }
 }
@@ -91,105 +102,175 @@ pub fn render_live_loop(
     frames_rx: Receiver<(usize, LiveFrame)>,
     stab_man: Arc<StabilizationManager>,
     cfg: LiveRenderConfig,
+    display_pix_fmt: PixelFormat, // <--- new: choose output format (Rgb24 / Rgba)
 ) {
-    let _fplay_instance = fplay::init_ffplay(1280, 720, cfg.present_fps).unwrap();
-
     println!("render_live: start");
     let mut initialized = false;
+
     while let Ok((_frame_idx, frame)) = frames_rx.recv() {
-        // 1) Get basic info
+
+        
         let (w, h) = frame.get_size();
         let ts_us = frame.ts_us();
-        let input_rgb = frame.as_rgb24();
-        let mut input_rgb_vec = input_rgb.to_vec();
+        let ts_ms = ts_us as f64 / 1000.0;
+        stab_man.live_on_new_frame(_frame_idx, ts_ms, 1);
+        
+        // Initialize stab + ffplay once we know the actual frame size
+        if !initialized {
+            
+            stab_man.set_render_params((w as usize, h as usize), (w as usize, h as usize));
+            log::info!("Live stabilization initialized for {}x{}", w, h);
 
-       if !initialized {
-        stab_man.set_render_params((w as usize, h as usize), (w as usize, h as usize));
-        log::info!("Live stabilization initialized for {}x{}", w, h);
-        initialized = true;
-    }
+            // init ffplay with the chosen display format (Rgb24 or Rgba)
+            if let Err(e) = fplay::init_ffplay(w, h, cfg.present_fps, display_pix_fmt) {
+                eprintln!("Failed to init ffplay: {e:?}");
+                return;
+            }
 
-
-        // Sanity check on size (defensive)
-        if input_rgb.len() != (w as usize) * (h as usize) * 3 {
-            eprintln!(
-                "render_live: bad buffer size: got {}, expected {}",
-                input_rgb.len(),
-                (w as usize) * (h as usize) * 3
-            );
-            continue;
+            initialized = true;
         }
 
-        
+        match frame.pix_fmt {
+            PixelFormat::Rgb24 => {
+                // -------- RGB24 input path --------
+                let input_rgb = frame.as_rgb24();
+                if input_rgb.len() != (w as usize) * (h as usize) * 3 {
+                    eprintln!(
+                        "render_live: bad RGB24 buffer size: got {}, expected {}",
+                        input_rgb.len(),
+                        (w as usize) * (h as usize) * 3
+                    );
+                    continue;
+                }
 
-        // 2) Allocate output buffer (RGB24)
-        let mut output_rgb = vec![0u8; (w as usize) * (h as usize) * 3];
+                let mut input_rgb_vec = input_rgb.to_vec();
+                let mut output_rgb = vec![0u8; (w as usize) * (h as usize) * 3];
 
-        let in_before  = checksum(&input_rgb_vec);
-        let out_before = checksum(&output_rgb);
+                let _in_before  = checksum(&input_rgb_vec);
+                let _out_before = checksum(&output_rgb);
 
-        // 3) Wrap into Buffers
-        let mut buffers = buffers_from_live_frame(&frame, input_rgb_vec.as_mut_slice(), &mut output_rgb);
-        
-        
+                let mut buffers = buffers_from_live_frame_rgb24(&frame, input_rgb_vec.as_mut_slice(), &mut output_rgb);
 
-        // 4) Stabilize this single frame (no explicit frame index → None)
-        match stab_man.process_pixels::<RGB8>(ts_us, None, &mut buffers) {
-            Ok(info) => {
-                let out_after = checksum(&output_rgb);
+                match stab_man.process_pixels::<RGB8>(ts_us, None, &mut buffers) {
+                    Ok(info) => {
+                        let _out_after = checksum(&output_rgb);
+                        
 
-                println!("backend used: {}", info.backend);
-                println!("output fov: {}", info.fov);
-                println!("minimal fov: {}", info.minimal_fov);
+                        // Decide how to send, based on display_pix_fmt
+                        match display_pix_fmt {
+                            PixelFormat::Rgb24 => {
+                                if let Err(e) = fplay::push_frame(&output_rgb) {
+                                    eprintln!("fplay::push_frame failed (RGB24->RGB24): {e:?}");
+                                }
+                            }
+                            PixelFormat::Rgba => {
+                                // Convert RGB24 -> RGBA for display
+                                let w_usize = w as usize;
+                                let h_usize = h as usize;
+                                let mut output_rgba = vec![0u8; w_usize * h_usize * 4];
 
-                // 5) Push stabilized frame to player
-                if let Err(e) = fplay::push_rgb24(&output_rgb) {
-                    //eprintln!("fplay::push_rgb24 failed: {e:?}");
+                                for i in 0..(w_usize * h_usize) {
+                                    let src = i * 3;
+                                    let dst = i * 4;
+                                    output_rgba[dst    ] = output_rgb[src    ];
+                                    output_rgba[dst + 1] = output_rgb[src + 1];
+                                    output_rgba[dst + 2] = output_rgb[src + 2];
+                                    output_rgba[dst + 3] = 255;
+                                }
+
+                                if let Err(e) = fplay::push_frame(&output_rgba) {
+                                    eprintln!("fplay::push_frame failed (RGB24->RGBA): {e:?}");
+                                }
+                            }
+                            PixelFormat::Nv12 => {
+                                eprintln!("render_live: display_pix_fmt=NV12 is not supported for ffplay");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Stabilization failed at ts_us={ts_us} (RGB24): {e:?}");
+                        continue;
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("Stabilization failed at ts_us={ts_us}: {e:?}");
+
+            PixelFormat::Rgba => {
+                // -------- RGBA input path --------
+                
+                let input_rgba = frame.as_rgba();
+                if input_rgba.len() != (w as usize) * (h as usize) * 4 {
+                    eprintln!(
+                        "render_live: bad RGBA buffer size: got {}, expected {}",
+                        input_rgba.len(),
+                        (w as usize) * (h as usize) * 4
+                    );
+                    continue;
+                }
+
+                let mut input_rgba_vec = input_rgba.to_vec();
+                let mut output_rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+
+                let mut buffers = buffers_from_live_frame_rgba(&frame, input_rgba_vec.as_mut_slice(), &mut output_rgba);
+
+                match stab_man.process_pixels::<RGBA8>(ts_us, None, &mut buffers) {
+                    Ok(info) => {
+                        
+
+                        match display_pix_fmt {
+                            PixelFormat::Rgba => {
+                                // Already RGBA, send directly
+                                if let Err(e) = fplay::push_frame(&output_rgba) {
+                                    eprintln!("fplay::push_frame failed (RGBA->RGBA): {e:?}");
+                                }
+                            }
+                            PixelFormat::Rgb24 => {
+                                // Convert RGBA -> RGB24 (drop alpha)
+                                let w_usize = w as usize;
+                                let h_usize = h as usize;
+                                let mut output_rgb = vec![0u8; w_usize * h_usize * 3];
+
+                                for i in 0..(w_usize * h_usize) {
+                                    let src = i * 4;
+                                    let dst = i * 3;
+                                    output_rgb[dst    ] = output_rgba[src    ];
+                                    output_rgb[dst + 1] = output_rgba[src + 1];
+                                    output_rgb[dst + 2] = output_rgba[src + 2];
+                                }
+
+                                if let Err(e) = fplay::push_frame(&output_rgb) {
+                                    eprintln!("fplay::push_frame failed (RGBA->RGB24): {e:?}");
+                                }
+                            }
+                            PixelFormat::Nv12 => {
+                                eprintln!("render_live: display_pix_fmt=NV12 is not supported for ffplay");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Stabilization failed at ts_us={ts_us} (RGBA): {e:?}");
+                        continue;
+                    }
+                }
+            }
+
+            PixelFormat::Nv12 => {
+                eprintln!(
+                    "render_live: received NV12 frame ({}x{}), but NV12 is not yet handled in render_live_loop. \
+                     Choose Rgb24 or Rgba as stream target format if you want stabilization.",
+                    w, h
+                );
                 continue;
             }
         }
     }
 
     log::info!("render_live: exit");
+    //fplay::shutdown_ffplay();
 }
 
+// ------------------------ buffer helpers ------------------------
 
-fn wait_for_map_blocking(
-    next_idx: usize,
-    maps_rx: &Receiver<StmapItem>,
-    cache: &mut MapCache,
-) -> Option<(Vec<u8>, Vec<u8>)> {
-    // Fast path: already cached?
-    if let Some(pair) = cache.take(next_idx) {
-        return Some(pair);
-    }
-
-    // Block until we get the exact map; cache out-of-order ones.
-    loop {
-        match maps_rx.recv() {
-            Ok((_fname, idx, dist, undist)) => {
-                if idx == next_idx {
-                    return Some((dist, undist));
-                } else {
-                    cache.insert(idx, dist, undist);
-                }
-            }
-            Err(_) => {
-                // Sender disconnected → no more maps will arrive
-                return None;
-            }
-        }
-    }
-
-
-}
-
-    
-fn buffers_from_live_frame<'a>(
+fn buffers_from_live_frame_rgb24<'a>(
     frame: &'a LiveFrame,
     input_rgb: &'a mut [u8],
     output_rgb: &'a mut [u8],
@@ -199,18 +280,14 @@ fn buffers_from_live_frame<'a>(
     let h_usize = h as usize;
     let stride = w_usize * 3; // RGB24: 3 bytes per pixel
 
-
-    let src = frame.as_rgb24();          // &[u8] or something similar
+    let src = frame.as_rgb24();
     input_rgb[..src.len()].copy_from_slice(src);
 
     let input_desc = BufferDescription {
         size: (w_usize, h_usize, stride),
         rect: None,
         rotation: None,
-        data: BufferSource::Cpu {
-            // type will be something like &'a [u8]
-            buffer: input_rgb,
-        },
+        data: BufferSource::Cpu { buffer: input_rgb },
         texture_copy: false,
     };
 
@@ -218,15 +295,41 @@ fn buffers_from_live_frame<'a>(
         size: (w_usize, h_usize, stride),
         rect: None,
         rotation: None,
-        data: BufferSource::Cpu {
-            // type will be something like &'a mut [u8]
-            buffer: output_rgb,
-        },
+        data: BufferSource::Cpu { buffer: output_rgb },
         texture_copy: false,
     };
 
-    Buffers {
-        input: input_desc,
-        output: output_desc,
-    }
+    Buffers { input: input_desc, output: output_desc }
+}
+
+fn buffers_from_live_frame_rgba<'a>(
+    frame: &'a LiveFrame,
+    input_rgba: &'a mut [u8],
+    output_rgba: &'a mut [u8],
+) -> Buffers<'a> {
+    let (w, h) = frame.get_size();
+    let w_usize = w as usize;
+    let h_usize = h as usize;
+    let stride = w_usize * 4; // RGBA: 4 bytes per pixel
+
+    let src = frame.as_rgba();
+    input_rgba[..src.len()].copy_from_slice(src);
+
+    let input_desc = BufferDescription {
+        size: (w_usize, h_usize, stride),
+        rect: None,
+        rotation: None,
+        data: BufferSource::Cpu { buffer: input_rgba },
+        texture_copy: false,
+    };
+
+    let output_desc = BufferDescription {
+        size: (w_usize, h_usize, stride),
+        rect: None,
+        rotation: None,
+        data: BufferSource::Cpu { buffer: output_rgba },
+        texture_copy: false,
+    };
+
+    Buffers { input: input_desc, output: output_desc }
 }

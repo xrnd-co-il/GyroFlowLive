@@ -8,7 +8,10 @@ use super::TimeQuat;
 use super::Quat64;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
-
+use std::collections::BTreeMap;
+use nalgebra::{Quaternion as NQuat, UnitQuaternion as NUnitQuat}; // adjust if you already import nalgebra elsewhere
+use std::path::Path;
+use crate::gyro_source::csv_quats;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LiveImuSample {
@@ -22,6 +25,16 @@ pub struct LiveClockSync {
     // Linear mapping sensor_time -> video_time: video = a*sensor + b (all µs)
     pub a: f64,  // scale
     pub b: f64,  // offset
+}
+
+impl LiveClockSync {
+    pub fn new(a: f64, b: f64) -> Self { Self { a, b } }
+}
+
+impl fmt::Display for LiveClockSync {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "LiveClockSync {{ a: {:.6}, b: {:.3} }}", self.a, self.b)
+    }
 }
 
 #[derive(Default)]
@@ -133,6 +146,62 @@ impl QuatBuffer {
         }
         self.quats.values().next_back().copied()
     }
+
+     pub fn to_btreemap(&self) -> BTreeMap<i64, Quat64> {
+        let mut map = BTreeMap::new();
+        for (dt_us, q) in &self.quats {
+            map.insert(*dt_us, *q);
+        }
+        map
+    }
+
+    /// Duration of this buffer in milliseconds (based on first/last timestamps).
+    pub fn duration_ms(&self) -> f64 {
+        if self.quats.len() < 2 {
+            return 0.0;
+        }
+        let mut first_ts = 0;
+        let mut last_ts = 0;
+        if let Some((first_key, first_value)) = self.quats.iter().next() {
+            first_ts = *first_key;
+        } 
+
+        // Get the last element (largest key)
+        if let Some((last_key, last_value)) = self.quats.iter().next_back() {
+            last_ts = *last_key;
+        }
+
+        (last_ts - first_ts) as f64 / 1000.0
+    }
+
+    pub fn from_csv_samples_range(
+        samples: &[crate::gyro_source::csv_quats::CsvQuatSample],
+        start_us: i64,
+        end_us: i64,
+    ) -> Option<Self> {
+        if samples.is_empty() || end_us < start_us {
+            return None;
+        }
+
+        let mut map: TimeQuat = TimeQuat::new();
+
+        // Insert only samples in [start_us, end_us]
+        for s in samples.iter() {
+            if s.t_us < start_us { continue; }
+            if s.t_us > end_us { break; }
+
+            // CSV: w,x,y,z
+            // nalgebra::Quaternion::new(w, i, j, k) where internal storage is [i, j, k, w]
+            let q = NQuat::new(s.qw, s.qx, s.qy, s.qz);
+
+            // Make it unit (safe even if slightly off due to float export)
+            let uq: Quat64 = NUnitQuat::new_normalize(q);
+
+            map.insert(s.t_us, uq);
+        }
+
+        QuatBuffer::from_btreemap(&map)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -239,6 +308,94 @@ impl QuatBufferStore {
         .select_centered_and_prune(t_ms, pre_ms, post_ms, center_ratio, true)?;
     buf.quat_at_ms(t_ms)
 }
+/// Get a buffer that covers a window around `t_ms`, without pruning the store.
+    pub fn get_buffer_for_time(
+        &self,
+        t_ms: f64,
+        pre_ms: f64,
+        post_ms: f64,
+        center_ratio: f64,
+    ) -> Option<Arc<QuatBuffer>> {
+        let (buf, _ver) =
+            self.select_centered_and_prune(t_ms, pre_ms, post_ms, center_ratio, false)?;
+        Some(buf)
+    }
+
+
+
+    pub fn get_latest_buffer(&self) -> Option<Arc<QuatBuffer>> {
+        let r = self.dq.read();
+        r.back().cloned()
+    }
+
+    /// Load quaternions from a CSV (org or stab depending on `stabbed`) and publish them
+    /// as sliding windows: each window is 3 seconds long, next window starts 1 second later.
+    ///
+    /// Returns (num_windows_published, last_version).
+    pub fn load_from_csv_sliding_windows<P: AsRef<Path>>(
+        &self,
+        path: P,
+        stabbed: bool,
+    ) -> Result<(usize, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let samples = csv_quats::load_quat_samples_from_csv(path, stabbed)?;
+        if samples.len() < 2 {
+            return Ok((0, self.version.load(Ordering::Relaxed)));
+        }
+
+        // Window config
+        let window_us: i64 = 3_000_000;
+        let step_us: i64   = 1_000_000;
+
+        let first_us = samples.first().unwrap().t_us;
+        let last_us  = samples.last().unwrap().t_us;
+
+        if last_us - first_us < 1000 {
+            return Ok((0, self.version.load(Ordering::Relaxed)));
+        }
+
+        // Two-pointer to avoid O(N^2) scanning
+        let mut win_start = first_us;
+        let mut i0: usize = 0;
+        let mut i1: usize = 0;
+
+        let mut published = 0_usize;
+        let mut last_ver = self.version.load(Ordering::Relaxed);
+
+        while win_start <= last_us {
+            let win_end = win_start + window_us;
+
+            // If the window is completely beyond data, stop.
+            if win_start > last_us {
+                break;
+            }
+
+            // Advance i0 until samples[i0].t_us >= win_start
+            while i0 < samples.len() && samples[i0].t_us < win_start {
+                i0 += 1;
+            }
+
+            // Ensure i1 >= i0
+            if i1 < i0 { i1 = i0; }
+
+            // Advance i1 until samples[i1].t_us > win_end (so [i0, i1) is in window)
+            while i1 < samples.len() && samples[i1].t_us <= win_end {
+                i1 += 1;
+            }
+
+            // Build buffer from that slice
+            if i0 < i1 {
+                if let Some(buf) = QuatBuffer::from_csv_samples_range(&samples[i0..i1], win_start, win_end) {
+                    let (_arc, ver) = self.publish(buf);
+                    published += 1;
+                    last_ver = ver;
+                }
+            }
+
+            win_start += step_us;
+        }
+
+        Ok((published, last_ver))
+    }
 
 }
 
@@ -265,4 +422,34 @@ impl Default for LiveState {
              enabled: AtomicBool::new(false),
          }
      }
+
 }
+
+impl LiveState {
+    pub fn enable_live(&self, keep_secs: f64) {
+        let keep_us = (keep_secs * 1_000_000.0).round() as i64;
+        let mut ring = self.ring.lock();
+        ring.keep_us = keep_us;
+        self.enabled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn disable_live(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn load_quats_from_csv_sliding_windows<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ){
+            self.quat_buffer_store_smoothed
+                .load_from_csv_sliding_windows(&path, true);
+            self.quat_buffer_store_org
+                .load_from_csv_sliding_windows(&path, false);
+        
+    }
+}
+

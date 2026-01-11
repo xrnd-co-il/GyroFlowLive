@@ -596,6 +596,10 @@ impl Stabilization {
             }
         }
     }
+
+    
+
+
    pub fn process_pixels<T: PixelType>(
     &self,
     timestamp_us: i64,
@@ -666,42 +670,31 @@ impl Stabilization {
             ));
         }
 
-        // ---------- DEBUG: kernel + buffer snapshot before any GPU/CPU work ----------
-        /*log::info!(
-            "process_pixels: timestamp_us={:?}, frame={:?}",
-            timestamp_us,
-            frame
-        );
-        log::info!(
-            "process_pixels: buffers.input.size={:?}, buffers.output.size={:?}",
-            buffers.input.size,
-            buffers.output.size
-        );
-        log::info!(
-            "process_pixels: kernel_params: \
-             w={}, h={}, out_w={}, out_h={}, stride={}, out_stride={}, \
-             src_rect={:?}, out_rect={:?}, bpp={}, matrix_count={}, \
-             flags={}, plane_index={}, bg_mode={}",
-            itm.kernel_params.width,
-            itm.kernel_params.height,
-            itm.kernel_params.output_width,
-            itm.kernel_params.output_height,
-            itm.kernel_params.stride,
-            itm.kernel_params.output_stride,
-            itm.kernel_params.source_rect,
-            itm.kernel_params.output_rect,
-            itm.kernel_params.bytes_per_pixel,
-            itm.kernel_params.matrix_count,
-            itm.kernel_params.flags,
-            itm.kernel_params.plane_index,
-            itm.kernel_params.background_mode,
-        );
-        log::info!(
-            "process_pixels: mesh_data_len={}",
-            itm.mesh_data.len()
-        );
-        */
-        // ---------------------------------------------------------------------------
+        // --- helper to log hashes of input/output buffers for GPU paths ---
+        fn log_buf_hashes(label: &str, buffers: &Buffers) {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            fn hash_buf(buf: &[u8]) -> u64 {
+                let mut hasher = DefaultHasher::new();
+                buf.hash(&mut hasher);
+                hasher.finish()
+            }
+
+            let (in_kind, in_hash) = match &buffers.input.data {
+                gpu::BufferSource::Cpu { buffer } => ("Cpu", hash_buf(buffer)),
+                other => ("lol", 0),
+            };
+            let (out_kind, out_hash) = match &buffers.output.data {
+                gpu::BufferSource::Cpu { buffer } => ("Cpu", hash_buf(buffer)),
+                other => ("lol", 0),
+            };
+
+            log::info!(
+                "{label}: input=({in_kind}, hash={in_hash}), output=({out_kind}, hash={out_hash})"
+            );
+        }
+        // ------------------------------------------------------------------
 
         // OpenCL path
         #[cfg(feature = "use-opencl")]
@@ -715,9 +708,16 @@ impl Stabilization {
                     return CACHED_OPENCL.with(|x| {
                         let mut cached = x.borrow_mut();
                         if let Some(cl) = cached.get(&hash) {
+                            // log BEFORE OpenCL processing
+                            log_buf_hashes("OpenCL BEFORE", buffers);
+
                             if let Err(err) = cl.undistort_image(buffers, &itm, drawing_buffer) {
                                 log::error!("OpenCL error undistort: {:?}", err);
                             }
+
+                            // log AFTER OpenCL processing
+                            log_buf_hashes("OpenCL AFTER", buffers);
+
                             ret.backend = "OpenCL";
                             Ok(ret)
                         } else {
@@ -728,9 +728,15 @@ impl Stabilization {
                     });
                 }
             } else if let Some(ref cl) = self.cl {
+                // log BEFORE OpenCL processing
+                log_buf_hashes("OpenCL BEFORE", buffers);
+
                 if let Err(err) = cl.undistort_image(buffers, &itm, drawing_buffer) {
                     log::error!("OpenCL error undistort: {:?}", err);
                 } else {
+                    // log AFTER OpenCL processing
+                    log_buf_hashes("OpenCL AFTER", buffers);
+
                     ret.backend = "OpenCL";
                     return Ok(ret);
                 }
@@ -748,7 +754,14 @@ impl Stabilization {
                     return CACHED_WGPU.with(|x| {
                         let mut cached = x.0.borrow_mut();
                         if let Some(wgpu) = cached.get(&hash) {
+                            // log BEFORE wgpu processing
+                            log_buf_hashes("wgpu BEFORE", buffers);
+
                             wgpu.undistort_image(buffers, &itm, drawing_buffer);
+
+                            // log AFTER wgpu processing
+                            log_buf_hashes("wgpu AFTER", buffers);
+
                             ret.backend = "wgpu";
                             Ok(ret)
                         } else {
@@ -764,7 +777,14 @@ impl Stabilization {
                     );
                 }
             } else if let Some(ref wgpu) = self.wgpu {
+                // log BEFORE wgpu processing
+                log_buf_hashes("wgpu BEFORE", buffers);
+
                 wgpu.undistort_image(buffers, &itm, drawing_buffer);
+
+                // log AFTER wgpu processing
+                log_buf_hashes("wgpu AFTER", buffers);
+
                 ret.backend = "wgpu";
                 return Ok(ret);
             } else {
@@ -772,35 +792,7 @@ impl Stabilization {
             }
         }
 
-        // ---------- DEBUG: hashes right before CPU ----------
-        #[cfg(debug_assertions)]
-        let (in_hash_before, out_hash_before) = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            fn hash_buf(buf: &[u8]) -> u64 {
-                let mut hasher = DefaultHasher::new();
-                buf.hash(&mut hasher);
-                hasher.finish()
-            }
-
-            let in_hash = match &buffers.input.data {
-                gpu::BufferSource::Cpu { buffer } => hash_buf(buffer),
-                _ => 0,
-            };
-            let out_hash = match &buffers.output.data {
-                gpu::BufferSource::Cpu { buffer } => hash_buf(buffer),
-                _ => 0,
-            };
-            log::info!(
-                "process_pixels: BEFORE CPU: in_hash={}, out_hash={}",
-                in_hash,
-                out_hash
-            );
-            (in_hash, out_hash)
-        };
-        // ---------------------------------------------------------------------------
-
-        // CPU path
+        // CPU path (no logging here anymore)
         let ok = match self.interpolation {
             Interpolation::Bilinear => {
                 Self::undistort_image_cpu::<2, T>(
@@ -881,33 +873,6 @@ impl Stabilization {
             }
         };
 
-        // ---------- DEBUG: hashes after CPU ----------
-        #[cfg(debug_assertions)]
-        {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            fn hash_buf(buf: &[u8]) -> u64 {
-                let mut hasher = DefaultHasher::new();
-                buf.hash(&mut hasher);
-                hasher.finish()
-            }
-
-            let in_hash_after = match &buffers.input.data {
-                gpu::BufferSource::Cpu { buffer } => hash_buf(buffer),
-                _ => 0,
-            };
-            let out_hash_after = match &buffers.output.data {
-                gpu::BufferSource::Cpu { buffer } => hash_buf(buffer),
-                _ => 0,
-            };
-           /*  log::info!(
-                "process_pixels: AFTER CPU:  in_hash={}, out_hash={}",
-                in_hash_after,
-                out_hash_after
-            );*/
-        }
-        // ---------------------------------------------------------------------------
-
         if ok {
             ret.backend = "CPU";
             return Ok(ret);
@@ -918,6 +883,7 @@ impl Stabilization {
     }
     Err(GyroflowCoreError::Unknown)
 }
+
 
 
 

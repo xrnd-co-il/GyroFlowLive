@@ -215,7 +215,7 @@ fn main() {
         "windows" => {
             println!("cargo:rustc-link-arg=/EXPORT:NvOptimusEnablement");
             println!("cargo:rustc-link-arg=/EXPORT:AmdPowerXpressRequestHighPerformance");
-            println!("cargo:rustc-link-search={}", std::env::var("OPENCV_LINK_PATHS").unwrap());
+           // println!("cargo:rustc-link-search={}", std::env::var("OPENCV_LINK_PATHS").unwrap());
             println!("cargo:rustc-link-search={}\\lib\\{}", std::env::var("FFMPEG_DIR").unwrap(), std::env::var("FFMPEG_ARCH").unwrap_or("x64".into()));
             println!("cargo:rustc-link-search={}\\lib", std::env::var("FFMPEG_DIR").unwrap());
             let mut res = winres::WindowsResource::new();

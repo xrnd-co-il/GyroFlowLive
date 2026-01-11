@@ -1765,6 +1765,7 @@ dependencies = [
  "core-foundation-sys",
  "crc32fast",
  "crossbeam-channel",
+ "csv",
  "cv-core",
  "cv-pinhole",
  "dyn-clone",
